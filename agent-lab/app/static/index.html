@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Lab</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">Agent Lab <span class="sub">local experiment workbench</span></div>
+  <nav>
+    <button data-tab="run" class="active">New job</button>
+    <button data-tab="topology">Topology</button>
+    <button data-tab="jobs">Jobs</button>
+    <button data-tab="settings">Settings</button>
+  </nav>
+  <label class="autoallow" id="autoallow" title="When on, every permission request from a job is approved immediately. Requests are still listed on the job page and sent as low-priority notifications. Shell commands stay inside the sandbox either way, but file edits outside the lab folder would be allowed.">
+    <input type="checkbox" id="autoallow-cb"><span class="switch"></span><span class="lbl">Auto-allow permissions</span>
+  </label>
+  <div id="statusbar" class="statusbar"></div>
+</header>
+
+<main>
+  <!-- NEW JOB -->
+  <section id="tab-run" class="tab active">
+    <div class="card narrow">
+      <h2>Describe the experiment</h2>
+      <form id="job-form">
+        <label>Title <input name="title" placeholder="e.g. Contrastive pretraining on CIFAR-10"></label>
+        <label>Specification (paste text, or attach a file below)
+          <textarea name="spec_text" rows="12" placeholder="What should be built, what data, what to measure…"></textarea>
+        </label>
+        <label class="file">Spec file (.pdf, .md, .txt, .tex)
+          <input type="file" name="file" accept=".pdf,.md,.txt,.tex">
+        </label>
+        <div class="prior-box">
+          <div class="row"><b class="grow">Build on earlier jobs <span class="muted small">(optional)</span></b>
+            <label class="check small"><input type="checkbox" id="prior-all"> all earlier jobs</label></div>
+          <p class="muted small">The new job gets a copy of each chosen job's workspace in <code>./prior/&lt;job-id&gt;/</code>, with a summary of how it went. The original jobs are never changed.</p>
+          <div id="prior-list" class="prior-list"></div>
+        </div>
+        <label>Notes for this run (optional)
+          <input name="notes" placeholder="e.g. keep the toy run under 5 minutes">
+        </label>
+        <div class="row">
+          <label class="small">Time limit, minutes <input name="time_limit_min" type="number" min="1" placeholder="default from Settings"></label>
+          <label class="small">Max turns (optional) <input name="max_turns" type="number" min="1" placeholder="no limit"></label>
+          <div id="run-topo" class="muted grow"></div>
+        </div>
+        <div class="row end"><button type="submit" class="primary">Start job</button></div>
+        <div id="job-form-msg" class="msg"></div>
+      </form>
+    </div>
+  </section>
+
+  <!-- TOPOLOGY -->
+  <section id="tab-topology" class="tab">
+    <div class="toolbar">
+      <select id="preset-select"></select>
+      <button id="btn-load-preset">Load preset</button>
+      <span class="sep"></span>
+      <button id="btn-add-node">+ Worker</button>
+      <span class="seg" id="edge-type">
+        <button data-et="delegate" class="active" title="Parent may spawn the child as a subagent">→ Delegate</button>
+        <button data-et="handoff" title="Output of A becomes input of B">⇢ Handoff</button>
+      </span>
+      <button id="btn-delete" title="Delete selected (Del)">Delete</button>
+      <span class="grow"></span>
+      <span id="dirty" class="muted"></span>
+      <button id="btn-discard">Discard</button>
+      <button id="btn-save" class="primary">Save as new version</button>
+    </div>
+    <div class="topo-wrap">
+      <div class="canvas-wrap">
+        <svg id="canvas" viewBox="0 0 1000 520">
+          <defs>
+            <marker id="arrow-delegate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-delegate"/></marker>
+            <marker id="arrow-handoff" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-handoff"/></marker>
+          </defs>
+          <g id="edges"></g><g id="nodes"></g><path id="temp-edge" class="temp-edge" d=""/>
+        </svg>
+        <div class="hint">Drag nodes to move them. Drag from a node's right-hand dot to another node to connect them, using the edge type picked above. Click a node or edge to edit it. Click empty space to edit the lab-wide instructions.</div>
+        <div id="topo-errors" class="errors"></div>
+      </div>
+      <aside id="inspector" class="card"></aside>
+    </div>
+    <div class="card">
+      <h3>Version history <a href="/api/compiled" target="_blank" class="muted small">see exactly what's sent to Claude Code ↗</a></h3>
+      <div id="versions"></div>
+    </div>
+  </section>
+
+  <!-- JOBS -->
+  <section id="tab-jobs" class="tab">
+    <div class="jobs-wrap">
+      <div class="card job-list"><h3>Jobs</h3><div id="job-list"></div></div>
+      <div class="card job-detail" id="job-detail"><p class="muted">Select a job.</p></div>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section id="tab-settings" class="tab">
+    <div class="card narrow">
+      <h2>Notifications (ntfy)</h2>
+      <p class="muted">Install the ntfy app on your phone and subscribe to a hard-to-guess topic name. Anyone who knows the topic on ntfy.sh can read it.</p>
+      <form id="settings-form">
+        <label>Server <input name="ntfy_server"></label>
+        <label>Topic <input name="ntfy_topic" placeholder="e.g. my-lab-7f3k2q (hard to guess)"></label>
+        <label>Access token (only for protected topics or self-hosted servers) <input name="ntfy_token" type="password" autocomplete="off"></label>
+        <div class="row">
+          <label class="check"><input type="checkbox" name="on_done"> notify when a job succeeds</label>
+          <label class="check"><input type="checkbox" name="on_failed"> when it fails</label>
+          <label class="check"><input type="checkbox" name="on_timed_out"> when it hits its time limit</label>
+          <label class="check"><input type="checkbox" name="on_cancelled"> when cancelled</label>
+        </div>
+        <p class="muted small">Permission requests always send a notification.</p>
+        <h2>Defaults</h2>
+        <div class="row">
+          <label class="small">Job time limit, minutes <input name="time_limit_min" type="number" min="1" placeholder="no limit"></label>
+          <label class="small">Deny unanswered permission requests after, minutes <input name="permission_timeout_min" type="number" min="1"></label>
+          <label class="small">Default max turns <input name="max_turns" type="number" min="1" placeholder="no limit"></label>
+        </div>
+        <div class="row">
+          <label class="small">Model for analysis &amp; self-improvement <input name="improver_model" placeholder="same as orchestrator"></label>
+          <label class="check"><input type="checkbox" name="auto_analyze"> analyze every finished job automatically and draft an improvement</label>
+        </div>
+        <div class="row">
+          <label class="grow">Cluster name, used in the "Make a Slurm version" template <input name="cluster_name" placeholder="e.g. the university GPU cluster"></label>
+        </div>
+        <div class="row end">
+          <button type="button" id="btn-test-notify">Send test notification</button>
+          <button type="submit" class="primary">Save settings</button>
+        </div>
+        <div id="settings-msg" class="msg"></div>
+      </form>
+    </div>
+    <div class="card narrow">
+      <h2>Sandbox self-test</h2>
+      <p class="muted">Starts a short Claude Code session that tries to read your home folder, list ~/Documents, write outside the lab, write inside it, and reach the internet. Then it repeats the risky checks through the GPU launcher, and checks that the GPU is visible through it. Everything outside the lab should be blocked; internet and GPU should work.</p>
+      <button id="btn-selftest" class="primary">Run self-test</button>
+    </div>
+    <div class="card narrow">
+      <h2>Agent Lab server</h2>
+      <p class="muted">Agent Lab runs in the background: the Terminal window that starts it closes itself. Stop it here, and open the Agent Lab icon to start it again. Its output goes to <code>agent-lab/runtime/server.log</code>.</p>
+      <div class="row"><button id="btn-restart">Restart</button><button class="danger" id="btn-shutdown">Stop Agent Lab</button></div>
+    </div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

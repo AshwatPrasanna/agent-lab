@@ -1,0 +1,27 @@
+(version 1)
+;; Agent Lab GPU profile, used by app/bin/lab-gpu.
+;; Starts from "allow" so Metal/MPS work, then fences user files and local services.
+;; In SBPL the last matching rule wins, so each "allow" below re-opens part of a "deny" above it.
+(allow default)
+
+;; Files: no reading or writing of user data, except this job's workspace and the shared cache.
+(deny file-read* (subpath "/Users") (subpath "/Volumes"))
+(allow file-read* (subpath "@WORK@") (subpath "@SHARED@"))
+(allow file-read-metadata @ANCESTORS@)
+(deny file-write* (subpath "/"))
+(allow file-write* (subpath "@WORK@") (subpath "@SHARED@")
+       (subpath "/private/tmp") (subpath "/private/var/folders") (subpath "/dev"))
+
+;; No driving other apps (they would run outside this sandbox).
+(deny appleevent-send)
+(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd")
+                  (global-name "com.apple.lsd.modifydb")
+                  (global-name "com.apple.coreservices.appleevents"))
+(deny process-exec (literal "/usr/bin/open") (literal "/usr/bin/osascript")
+                   (literal "/usr/bin/automator") (literal "/usr/bin/shortcuts")
+                   (literal "/usr/bin/sandbox-exec"))
+
+;; No local services: Agent Lab's own API, Docker, anything listening on localhost.
+(deny network-outbound (remote ip "localhost:*"))
+(deny network-outbound (remote unix-socket (path-regex #"^/Users/")))
+(deny network-outbound (remote unix-socket (path-literal "/private/var/run/docker.sock")))

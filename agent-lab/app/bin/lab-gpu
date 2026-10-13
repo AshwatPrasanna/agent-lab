@@ -1,0 +1,30 @@
+#!/bin/bash
+# lab-gpu: run ONE command with access to the Mac's GPU (Metal / MLX / PyTorch MPS).
+# Claude Code's sandbox hides the GPU, so Agent Lab lists this script in the job's
+# `excludedCommands` and instead confines the command with its own macOS sandbox
+# profile (app/sandbox/gpu.sb): it can read/write only this job's workspace and the
+# shared cache, cannot read the rest of your home folder, and cannot reach localhost.
+# Agents can't modify this file or the profile: app/ is outside their writable folders.
+set -euo pipefail
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+LAB="$(cd "$APP_DIR/.." && pwd -P)"
+CWD="$(pwd -P)"
+case "$CWD/" in
+  "$LAB/jobs/"*/work/*) ;;
+  *) echo "lab-gpu: run me from inside a job workspace (cwd is $CWD)" >&2; exit 2 ;;
+esac
+rest="${CWD#"$LAB/jobs/"}"
+JOB_ID="${rest%%/*}"
+if ! [[ "$JOB_ID" =~ ^[a-z0-9-]+$ ]]; then echo "lab-gpu: bad job folder" >&2; exit 2; fi
+WORK="$LAB/jobs/$JOB_ID/work"
+SHARED="$LAB/shared"
+if [ $# -lt 1 ]; then echo "usage: lab-gpu <command> [args...]" >&2; exit 2; fi
+
+# Every ancestor folder of WORK and SHARED may be stat()-ed (needed for path lookups), not read.
+anc=""
+for base in "$WORK" "$SHARED"; do
+  p="$base"
+  while [ "$p" != "/" ] && [ -n "$p" ]; do p="$(dirname "$p")"; anc="$anc (literal \"$p\")"; done
+done
+PROFILE="$(sed -e "s#@WORK@#$WORK#g" -e "s#@SHARED@#$SHARED#g" -e "s#@ANCESTORS@#$anc#" "$APP_DIR/sandbox/gpu.sb")"
+exec /usr/bin/sandbox-exec -p "$PROFILE" "$@"

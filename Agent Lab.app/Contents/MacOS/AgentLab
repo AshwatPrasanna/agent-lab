@@ -1,0 +1,14 @@
+#!/bin/bash
+# Agent Lab launcher: opens Agent Lab in your browser. If it isn't running yet, starts it
+# through start.command in Terminal (which has access to your Desktop folder); that Terminal
+# window closes itself once Agent Lab is up.
+APP_PARENT="$(cd "$(dirname "$0")/../../.." && pwd -P)"
+LAB="$APP_PARENT/agent-lab"
+[ -d "$LAB/app" ] || LAB="$HOME/Desktop/agent-lab"
+URL="http://127.0.0.1:${AGENT_LAB_PORT:-8765}"
+if /usr/bin/curl -s -m 1 -o /dev/null "$URL/api/status"; then
+  /usr/bin/open "$URL"
+else
+  /usr/bin/open -a Terminal "$LAB/start.command"
+fi
+exit 0

@@ -1,0 +1,8 @@
+# created at runtime: personal data, job outputs, caches
+agent-lab/config/
+agent-lab/jobs/
+agent-lab/shared/
+agent-lab/runtime/
+__pycache__/
+*.pyc
+.DS_Store
