@@ -4,6 +4,8 @@ A small localhost web app for macOS that runs [Claude Code](https://code.claude.
 
 It's meant for prototyping an experiment at toy scale on a Mac before scaling it up on a Slurm cluster.
 
+_Note: The app was built by Claude, using co-authored (human and AI) specifications. Although it's designed to be safe, at your own risk._
+
 ## Features
 
 - **Specs as text or files.** Paste a spec, or attach a PDF, Markdown, text or LaTeX file. Every job gets its own workspace folder.
