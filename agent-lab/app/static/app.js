@@ -48,9 +48,9 @@ async function loadStatus(refresh = false) {
   pills.push(`<span class="pill ${s.ntfy_configured ? "ok" : "warn"}">${s.ntfy_configured ? "ntfy on" : "ntfy not set"}</span>`);
   if (s.code_stale) pills.unshift(`<span class="pill warn restart-pill" title="Agent Lab's files changed since it started">⟳ Update ready: restart</span>`);
   const pend = s.pending_permissions || [];
-  if (pend.length) pills.unshift(`<span class="pill bad perm-pill" data-job="${esc(pend[0].job)}">✋ ${pend.length} permission request${pend.length === 1 ? "" : "s"} waiting</span>`);
+  if (pend.length) pills.unshift(`<span class="pill bad perm-pill" data-job="${esc(pend[0].job)}" data-chat="${pend[0].chat ? 1 : ""}">✋ ${pend.length} permission request${pend.length === 1 ? "" : "s"} waiting</span>`);
   bar.innerHTML = pills.join("");
-  const pp = $(".perm-pill", bar); if (pp) pp.onclick = (e) => { e.stopPropagation(); showTab("jobs"); openJob(pp.dataset.job); };
+  const pp = $(".perm-pill", bar); if (pp) pp.onclick = (e) => { e.stopPropagation(); showTab("jobs"); openJob(pp.dataset.job, pp.dataset.chat ? "ask" : undefined); };
   const rp = $(".restart-pill", bar); if (rp) rp.onclick = (e) => { e.stopPropagation(); restartServer(); };
   bar.title = "Click to re-check";
   setAutoAllow(!!s.auto_allow_permissions);
@@ -375,8 +375,10 @@ async function loadJobs() {
     : `<p class="muted">No jobs yet.</p>`;
   $$(".job-item").forEach((el) => el.onclick = () => openJob(el.dataset.id));
 }
-async function openJob(id) {
-  currentJob = id; jobItems = []; jobSubtab = "activity";
+async function openJob(id, sub) {
+  if (currentJob === id && sub) { jobSubtab = sub; if ($("#jd-head")) { pollJob(); return; } }
+  currentJob = id; jobItems = []; jobSubtab = sub || "activity";
+  Chat.reset();
   for (const k in panelKeys) delete panelKeys[k];
   clearTimeout(pollTimer);
   try { history.replaceState(null, "", "#job=" + id); } catch (e) {}
@@ -402,10 +404,12 @@ function renderJob(data, first) {
   const active = ACTIVE.includes(j.status);
   if (first || !$("#jd-head")) {
     el.innerHTML = `<div id="jd-head"></div><div id="jd-perms"></div>
-      <div class="subtabs"><button data-st="activity">Activity</button><button data-st="result">Result</button><button data-st="files">Files</button></div>
+      <div class="subtabs"><button data-st="activity">Activity</button><button data-st="result">Result</button><button data-st="files">Files</button><button data-st="ask" title="A throwaway chat about this job: questions and small fixes">💬 Ask</button></div>
       <div id="jd-body"></div><div id="jd-improve"></div>`;
     $$(".subtabs button", el).forEach((b) => b.onclick = () => { jobSubtab = b.dataset.st; renderSub(j); });
   }
+  const askBtn = $('.subtabs [data-st="ask"]', el);
+  if (askBtn) { askBtn.hidden = active || j.kind === "selftest"; if (askBtn.hidden && jobSubtab === "ask") jobSubtab = "activity"; }
   const tok = m.tokens || {};
   const pauseBtn = j.status === "running" ? `<button id="btn-pause">⏸ Pause</button>` : j.status === "paused" ? `<button class="primary" id="btn-resume">▶ Resume</button>` : "";
   $("#jd-head").innerHTML = `<div class="row"><h2 class="grow" style="margin:0">${esc(j.title)}</h2>
@@ -490,6 +494,8 @@ function renderSub(j) {
     const log = $(".log", body); if (atBottom) log.scrollTop = log.scrollHeight;
   } else if (jobSubtab === "result") {
     body.innerHTML = j.result ? `<pre class="view">${esc(j.result)}</pre>` : `<p class="muted">No final result yet.</p>`;
+  } else if (jobSubtab === "ask") {
+    if (!$(".chat", body) || Chat.jid !== j.id) Chat.mount(j);
   } else if (jobSubtab === "files" && !$(".files", body)) {
     body.innerHTML = `<div class="files"><div class="list" id="flist">Loading…</div><div id="fview"><p class="muted">Pick a file.</p></div></div>`;
     api(`/api/jobs/${j.id}/files`).then((fs) => {
@@ -546,11 +552,113 @@ function renderImprove(j, active) {
   const u = $("#imp-undo"); if (u) u.onclick = async () => { await api(`/api/jobs/${j.id}/improve/undo`, { method: "POST" }).catch((e) => alert(e.message)); Topo.cfg = null; pollJob(); };
 }
 
+/* ---------------------------------------------------------------- job chat (Ask tab) */
+// A throwaway single-agent chat on a finished job. The server keeps it in memory only.
+const mdInline = (s) => esc(s).replace(/`([^`\n]+)`/g, "<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>").replace(/^#{1,4} (.+)$/gm, "<b>$1</b>");
+const md = (s) => String(s).split("```").map((p, i) => (i % 2 ? `<pre>${esc(p.replace(/^[\w+.-]*\n/, ""))}</pre>` : mdInline(p))).join("");
+const Chat = {
+  jid: null, id: null, items: [], data: null, timer: null, key: "", permKey: "",
+  reset() { clearTimeout(this.timer); Object.assign(this, { jid: null, id: null, items: [], data: null, key: "", permKey: "" }); },
+  mount(j) {
+    if (this.jid !== j.id) { this.reset(); this.jid = j.id; }
+    this.key = this.permKey = "";
+    $("#jd-body").innerHTML = `<div class="chat">
+      <p class="muted small">One assistant working in this job's folder, inside the same sandbox the agents had. It knows what the agents did and can read and edit the files, run tests and use the GPU. Edits it makes are real. The conversation itself isn't saved: it's gone when you start a new chat or quit Agent Lab.</p>
+      <div class="chat-log" id="chat-log"></div><div id="chat-perms"></div>
+      <div class="chat-box"><textarea id="chat-text" rows="3" placeholder="Ask a question or describe a small fix. Enter sends, Shift+Enter adds a line."></textarea>
+        <div class="chat-btns"><button class="primary" id="chat-send">Send</button><button id="chat-stop" hidden>■ Stop</button></div></div>
+      <div class="row small muted chat-foot"><span id="chat-meta" class="grow"></span><button id="chat-new">New chat</button></div></div>`;
+    const ta = $("#chat-text"), dk = "chat:" + j.id;
+    ta.value = drafts[dk] || "";
+    ta.oninput = () => (drafts[dk] = ta.value);
+    ta.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); this.send(); } };
+    $("#chat-send").onclick = () => this.send();
+    $("#chat-stop").onclick = () => api(`/api/jobs/${this.jid}/chat/stop`, { method: "POST" }).catch((e) => alert(e.message));
+    $("#chat-new").onclick = async () => {
+      if (this.items.length && !confirm("Start a new chat? This conversation will be gone for good. (File changes stay.)")) return;
+      await api(`/api/jobs/${this.jid}/chat/close`, { method: "POST" }).catch(() => {});
+      Object.assign(this, { id: null, items: [], data: null }); this.render(); loadStatus();
+    };
+    this.render(); this.poll();
+  },
+  async poll() {
+    clearTimeout(this.timer);
+    const jid = this.jid; if (!jid) return;
+    const since = this.items.length ? this.items[this.items.length - 1].n + 1 : 0;
+    let r; try { r = await api(`/api/jobs/${jid}/chat?since=${since}`); } catch (e) { this.timer = setTimeout(() => this.poll(), 3000); return; }
+    if (jid !== this.jid) return;
+    const c = r.chat;
+    if (!c) Object.assign(this, { id: null, items: [], data: null });
+    else {
+      if (c.id !== this.id && since > 0) { this.id = c.id; this.items = []; return this.poll(); }  // a new session: reload
+      this.id = c.id; this.items.push(...c.items); this.data = c;
+    }
+    this.render();
+    if (c && (c.busy || c.perms.some((p) => p.status === "pending"))) this.timer = setTimeout(() => this.poll(), 700);
+  },
+  async send() {
+    const ta = $("#chat-text"); if (!ta) return;
+    const text = ta.value.trim();
+    if (!text || (this.data && this.data.busy)) return;
+    $("#chat-send").disabled = true;
+    try {
+      await api(`/api/jobs/${this.jid}/chat`, { json: { message: text } });
+      ta.value = ""; drafts["chat:" + this.jid] = "";
+      this.stick = true;
+    } catch (e) { alert(e.message); }
+    this.poll();
+  },
+  itemHtml(it) {
+    if (it.role === "assistant") return `<div class="cm assistant">${md(it.text)}</div>`;
+    if (it.role === "user") return `<div class="cm user">${esc(it.text)}</div>`;
+    if (it.role === "tool") return `<div class="cm tool">⚙ ${esc(it.text)}</div>`;
+    if (it.role === "error") return `<div class="cm error">✗ ${esc(it.text)}</div>`;
+    return `<div class="cm note">${esc(it.text)}</div>`;
+  },
+  render() {
+    const log = $("#chat-log"); if (!log) return;
+    const c = this.data, busy = !!(c && c.busy);
+    const key = [this.id, this.items.length, busy, c ? c.draft.length : 0, c && c.ended].join("|");
+    if (key !== this.key) {
+      this.key = key;
+      const atBottom = this.stick || log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+      log.innerHTML = (this.items.length ? this.items.map((it) => this.itemHtml(it)).join("")
+        : `<div class="muted small chat-empty">Ask about this job, or ask for a small fix. For example: “Why was the toy run slow?”, “Where is the learning rate set?”, “Run the tests and fix whatever fails.”</div>`)
+        + (busy ? `<div class="cm assistant live">${c.draft ? md(c.draft) : `<span class="muted">${this.items.length > 1 ? "working…" : "starting the assistant…"}</span>`}</div>` : "");
+      if (atBottom) log.scrollTop = log.scrollHeight;
+      this.stick = false;
+    }
+    $("#chat-send").disabled = busy; $("#chat-stop").hidden = !busy;
+    $("#chat-meta").textContent = c ? `${c.model} · ≈$${c.cost.toFixed(c.cost < 1 ? 3 : 2)} API-equivalent so far · ${c.ended ? "session ended" : busy ? "answering…" : "ready"}`
+      : "Not started yet: your first message starts the assistant.";
+    this.renderPerms();
+  },
+  renderPerms() {
+    const el = $("#chat-perms"); if (!el) return;
+    const pend = ((this.data && this.data.perms) || []).filter((p) => p.status === "pending");
+    const key = pend.map((p) => p.id).join("|");
+    if (key === this.permKey || el.contains(document.activeElement)) return;
+    this.permKey = key; loadStatus();
+    el.innerHTML = pend.map((p) => `<div class="perm" data-rid="${p.id}">
+        <div><b>✋ Permission needed</b> · <span class="muted">the assistant wants to use</span> <b>${esc(p.tool_name)}</b></div>
+        <pre>${esc(p.summary)}</pre>
+        <div class="row"><input class="grow perm-note" placeholder="Optional note to the assistant">
+          <button class="danger" data-d="deny">Deny</button><button class="primary" data-d="allow">Allow once</button></div></div>`).join("");
+    $$(".perm", el).forEach((card) => $$("[data-d]", card).forEach((b) => b.onclick = async () => {
+      $$("button", card).forEach((x) => (x.disabled = true));
+      try { await api(`/api/jobs/${this.jid}/chat/permissions/${card.dataset.rid}/decide`, { json: { behavior: b.dataset.d, message: $(".perm-note", card).value } }); }
+      catch (e) { alert(e.message); }
+      if (document.activeElement) document.activeElement.blur();
+      this.permKey = null; this.poll(); loadStatus();
+    }));
+  },
+};
+
 /* ---------------------------------------------------------------- settings */
 const NOTIFY_KINDS = ["done", "failed", "timed_out", "cancelled"];
 async function loadSettings() {
   const s = await api("/api/settings"), f = $("#settings-form");
-  for (const k of ["ntfy_server", "ntfy_topic", "ntfy_token", "max_turns", "improver_model", "time_limit_min", "permission_timeout_min", "cluster_name"]) f.elements[k].value = s[k] ?? "";
+  for (const k of ["ntfy_server", "ntfy_topic", "ntfy_token", "max_turns", "improver_model", "chat_model", "time_limit_min", "permission_timeout_min", "cluster_name"]) f.elements[k].value = s[k] ?? "";
   for (const k of NOTIFY_KINDS) f.elements["on_" + k].checked = (s.notify_on || []).includes(k);
   f.elements.auto_analyze.checked = s.auto_analyze !== false;
 }
@@ -558,7 +666,7 @@ $("#settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target, msg = $("#settings-msg"), num = (k) => (f.elements[k].value ? +f.elements[k].value : null);
   const body = { ntfy_server: f.elements.ntfy_server.value.trim() || "https://ntfy.sh", ntfy_topic: f.elements.ntfy_topic.value.trim(),
-    ntfy_token: f.elements.ntfy_token.value, improver_model: f.elements.improver_model.value.trim(),
+    ntfy_token: f.elements.ntfy_token.value, improver_model: f.elements.improver_model.value.trim(), chat_model: f.elements.chat_model.value.trim(),
     max_turns: num("max_turns"), cluster_name: f.elements.cluster_name.value.trim(), time_limit_min: num("time_limit_min"), permission_timeout_min: num("permission_timeout_min"),
     auto_analyze: f.elements.auto_analyze.checked, notify_on: NOTIFY_KINDS.filter((k) => f.elements["on_" + k].checked) };
   try { await api("/api/settings", { json: body }); msg.className = "msg"; msg.textContent = "Saved."; loadStatus(); }

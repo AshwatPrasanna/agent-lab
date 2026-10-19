@@ -24,6 +24,7 @@ _Note: The app was built by Claude, using co-authored (human and AI) specificati
   - Each job has a time limit (paused time doesn't count).
   - Agents are told to stop and report rather than loop when they're stuck.
 - **Building on earlier jobs.** A new job can get copies of earlier jobs' workspaces in `./prior/<job-id>/`. These are APFS clones, so they're instant and free on disk. **Make a Slurm version** turns a working local prototype into a cluster job: an sbatch script, the config for the full run, and instructions. It never submits anything.
+- **Ask: a follow-up chat on each finished job.** One assistant works in that job's folder, in the same sandbox, with the agents' activity log as context. Use it for questions about the run and for small fixes; it can read and edit files, run tests and use the GPU. The conversation is held only in memory, never written to disk: it's gone when you start a new chat or stop Agent Lab. File changes it makes are real.
 - **Notifications** through [ntfy](https://ntfy.sh) when a job finishes, fails, times out, or needs permission.
 
 ## Requirements
@@ -50,6 +51,7 @@ Every job runs `claude -p` with settings written by the app (`jobs/<id>/settings
 - **`blockReadsOutsideWorkingDirectories`:** file tools and shell commands can read only the job's workspace and `shared/`. Writes are limited to the same folders. Credential folders (`~/.ssh`, `~/.aws` and so on) are also denied explicitly.
 - **Nothing from your own setup is loaded:** no user settings, plugins, hooks, MCP servers or auto memory. `ANTHROPIC_API_KEY` is removed from the environment, so jobs use your Claude subscription.
 - **`lab-gpu`** is excluded from Claude Code's sandbox and applies its own profile (`app/sandbox/gpu.sb`) instead. That profile allows reading and writing only the job's workspace and `shared/`, and blocks reading the rest of `/Users`, localhost (the app's own API), Apple Events, and launching other apps. The launcher and profile live in `app/`, which agents can't write to.
+- **The Ask chat** uses the same sandbox and permission handling. Its settings and context are passed on the command line rather than written to disk, and it runs with `--no-session-persistence`.
 - **The web app only accepts requests from its own page.** It requires a custom header that other websites can't send.
 
 System folders (`/usr`, `/opt`, …) stay readable, because programs need them. Claude Code's sandbox reduces risk but isn't a VM. Run the self-test after Claude Code updates.

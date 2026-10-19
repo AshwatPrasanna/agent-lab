@@ -6,7 +6,8 @@ Claude Code runs this hook outside the sandbox whenever a tool call would otherw
 need someone to approve it. Jobs have no terminal to approve in, so without this
 hook those calls would simply be refused.
 
-usage: permission_hook.py <job_id> <token> <port> <timeout_seconds>
+usage: permission_hook.py <job_id> <token> <port> <timeout_seconds> [jobs|chats]
+(the follow-up chat passes its chat id and "chats")
 """
 import json
 import sys
@@ -32,11 +33,12 @@ def answer(behavior, message=None):
 
 def main():
     jid, token, port, timeout = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+    kind = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] in ("jobs", "chats") else "jobs"
     try:
         data = json.load(sys.stdin)
     except Exception:  # noqa: BLE001
         answer("deny", "Agent Lab could not read this permission request.")
-    base = f"http://127.0.0.1:{port}/api/jobs/{jid}/permissions"
+    base = f"http://127.0.0.1:{port}/api/{kind}/{jid}/permissions"
     try:
         req = call(f"{base}?token={token}", {"tool_name": data.get("tool_name"), "tool_input": data.get("tool_input"),
                                              "agent": data.get("agent_type") or ("subagent" if data.get("agent_id") else "orchestrator"),

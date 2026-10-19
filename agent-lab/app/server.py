@@ -21,6 +21,7 @@ from typing import Optional
 
 from webkit import App, FileResp, HTTPException
 
+import chat as chatmod
 import presets
 import prior
 import procs
@@ -58,7 +59,7 @@ ACTIVE = ("running", "queued", "paused", "cancelling")
 DEFAULT_SETTINGS = {"ntfy_server": "https://ntfy.sh", "ntfy_topic": "", "ntfy_token": "",
                     "notify_on": ["done", "failed", "timed_out"], "max_turns": None, "improver_model": "",
                     "time_limit_min": 120, "permission_timeout_min": 30, "auto_analyze": True,
-                    "auto_allow_permissions": False, "cluster_name": ""}
+                    "auto_allow_permissions": False, "cluster_name": "", "chat_model": ""}
 
 app = App(static_dir=Path(__file__).resolve().parent / "static")
 
@@ -83,8 +84,13 @@ BOOT_TIME = time.time()
 def read_json(p: Path, default=None):
     try:
         return json.loads(p.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError):  # missing, not a directory, unreadable, half-written
         return copy.deepcopy(default)
+
+
+def job_dirs():
+    """Job folders only: skips files macOS adds, like .DS_Store, and anything that isn't a job id."""
+    return [p for p in JOBS.iterdir() if p.is_dir() and re.match(r"^[a-z0-9-]+$", p.name)]
 
 
 def write_json(p: Path, obj):
@@ -752,10 +758,12 @@ def api_status(refresh: bool = False):
     st["ntfy_configured"] = bool(get_settings().get("ntfy_topic"))
     st["experiment_python"] = (SHARED / "python").exists()
     pending = []
-    for p in JOBS.iterdir():
+    for p in job_dirs():
         j = read_json(p / "job.json")
         if j and j.get("status") in ACTIVE:
             pending += [{"job": j["id"], "title": j["title"]} for r in load_perms(p) if r["status"] == "pending"]
+    for c in list(CHATS.values()):
+        pending += [{"job": c.jid, "title": "chat", "chat": True} for r in c.perms if r["status"] == "pending"]
     st["pending_permissions"] = pending
     st["auto_allow_permissions"] = bool(get_settings().get("auto_allow_permissions"))
     st["code"] = {"running": BOOT_HASH, "on_disk": code_hash(), "started": BOOT_TIME}
@@ -766,13 +774,14 @@ def api_status(refresh: bool = False):
 @app.post("/api/admin/shutdown")
 def api_shutdown(body: dict):
     """Stop the Agent Lab server (used when it was started from the Agent Lab icon, with no Terminal window)."""
-    running = [j["id"] for j in (read_json(p / "job.json") for p in JOBS.iterdir()) if j and j.get("status") in ACTIVE]
+    running = [j["id"] for j in (read_json(p / "job.json") for p in job_dirs()) if j and j.get("status") in ACTIVE]
     if running and not body.get("force"):
         raise HTTPException(409, f"{len(running)} job(s) still running; stopping Agent Lab would stop them")
 
     def later():
         time.sleep(0.5)
         print("Agent Lab: stopped from the web page", flush=True)
+        close_all_chats()
         os._exit(0)
     threading.Thread(target=later, daemon=True).start()
     return {"ok": True}
@@ -791,13 +800,14 @@ def api_close_terminal(body: dict):
 @app.post("/api/admin/restart")
 def api_restart(body: dict):
     """Restart this server in place (same process, same Terminal window) to load updated code."""
-    running = [j["id"] for j in (read_json(p / "job.json") for p in JOBS.iterdir()) if j and j.get("status") in ACTIVE]
+    running = [j["id"] for j in (read_json(p / "job.json") for p in job_dirs()) if j and j.get("status") in ACTIVE]
     if running and not body.get("force"):
         raise HTTPException(409, f"{len(running)} job(s) still running; restarting would stop them")
 
     def later():
         time.sleep(0.7)
         print("Agent Lab: restarting to load updated code", flush=True)
+        close_all_chats()
         os.execv(sys.executable, [sys.executable] + sys.argv)
     threading.Thread(target=later, daemon=True).start()
     return {"ok": True}
@@ -832,8 +842,13 @@ def api_set_settings(body: dict):
 
 
 def approve_all_pending():
-    """Auto-allow was switched on: approve anything already waiting in running jobs."""
-    for p in JOBS.iterdir():
+    """Auto-allow was switched on: approve anything already waiting in running jobs and chats."""
+    for c in list(CHATS.values()):
+        with c.lock:
+            for r in c.perms:
+                if r["status"] == "pending":
+                    r.update(status="allowed", auto=True, decided=time.time(), message="auto-allowed")
+    for p in job_dirs():
         j = read_json(p / "job.json")
         if not j or j.get("status") not in ACTIVE:
             continue
@@ -978,7 +993,7 @@ def api_selftest():
 @app.get("/api/jobs")
 def api_jobs():
     out = []
-    for p in sorted(JOBS.iterdir(), reverse=True):
+    for p in sorted(job_dirs(), reverse=True):
         j = read_json(p / "job.json")
         if j:
             row = {k: j.get(k) for k in ("id", "title", "kind", "status", "created", "started", "finished", "config_version", "prior")}
@@ -1189,8 +1204,215 @@ def api_undo(jid: str):
     return imp
 
 
+# --------------------------------------------------------------------------- throwaway Q&A chat
+# One single-agent session per finished job, held only in memory (see chat.py). Nothing is written
+# to disk: Claude Code's settings and the context are passed on the command line, and the session
+# runs with --no-session-persistence. Restarting or stopping Agent Lab ends every chat.
+CHATS: dict[str, chatmod.ChatSession] = {}  # job id -> its chat
+CHAT_TOOLS = "Bash,Edit,Glob,Grep,Read,WebFetch,WebSearch,Write"
+
+
+def close_all_chats():
+    for jid in list(CHATS):
+        c = CHATS.pop(jid, None)
+        if c:
+            c.close(wait=True)
+
+
+import atexit  # noqa: E402
+atexit.register(close_all_chats)
+
+
+def chat_model() -> str:
+    return get_settings().get("chat_model") or analysis_model()
+
+
+def _work_listing(work: Path, limit: int = 250) -> list[str]:
+    skip = {".venv", "venv", "__pycache__", ".git", ".pytest_cache", "node_modules", ".claude", ".mypy_cache"}
+    out = []
+    for root, dirs, files in os.walk(work):
+        rel = Path(root).relative_to(work)
+        if rel.parts[:1] == ("prior",):  # earlier jobs' copies: list the folders only
+            out += [f"prior/{d}/" for d in sorted(dirs)] if rel == Path("prior") else []
+            dirs[:] = []
+            continue
+        dirs[:] = sorted(d for d in dirs if d not in skip and not d.endswith("_venv"))
+        out += [str(rel / f) if str(rel) != "." else f for f in sorted(files) if f != ".DS_Store"]
+        if len(out) > limit:
+            return out[:limit] + ["… (more files not listed)"]
+    return out
+
+
+def chat_context(jid: str) -> str:
+    """The assistant's instructions plus what the agents did, from the job's own records."""
+    jd = job_dir(jid)
+    job = load_job(jid)
+    d = load_digest(jd / "events.jsonl")
+    m = read_json(jd / "metrics.json") or d.metrics(end_ts=job.get("finished"))
+    parts = [rules.CHAT_PROMPT.replace("{LAB_GPU}", LAB_GPU), "",
+             "# The job this chat is about", "",
+             f"- title: {job.get('title')}", f"- job id: {jid}",
+             f"- status: {job.get('status')}" + (f" ({job.get('error')})" if job.get("error") and job.get("status") != "done" else ""),
+             f"- ran: {fmt_dur(active_seconds(job))} · {m.get('num_turns') or '?'} turns · {m.get('tool_calls', 0)} tool calls · "
+             f"{m.get('errors', 0)} tool errors", f"- topology version: v{job.get('config_version')}",
+             f"- spec: ./{job.get('spec_file', 'spec.md')}"]
+    if job.get("notes"):
+        parts.append(f"- the user's notes for the run: {job['notes']}")
+    if job.get("prior"):
+        parts.append(f"- built on earlier jobs (copies in ./prior/): {', '.join(job['prior'])}")
+    dg = job.get("diagnosis") or {}
+    if dg.get("status") == "ready":
+        parts += ["", "## Agent Lab's analysis of the run", dg.get("headline", "")]
+        parts += [f"- {i.get('title')}: {i.get('evidence')}" for i in dg.get("issues", [])]
+    parts += ["", "## The job's final message", str(job.get("result") or "(none)")[:8000],
+              "", "## Files in the workspace (virtual environments and caches left out)", *_work_listing(jd / "work"),
+              "", "## What the agents did (activity log, oldest first; times in seconds from the start)",
+              "Long logs have their middle cut out. The files in the workspace are the source of truth.",
+              transcript_markdown(d, 40000)]
+    return "\n".join(parts)
+
+
+def chat_command(jid: str, c: chatmod.ChatSession) -> list[str]:
+    exe = find_claude()
+    if not exe:
+        raise HTTPException(400, "Claude Code CLI not found on this Mac")
+    s = _base_sandbox_settings()
+    s["permissions"]["allow"] = ["Bash", "WebFetch", "WebSearch", "WebFetch(domain:*)"]
+    tout = int(get_settings().get("permission_timeout_min") or 30) * 60
+    s["hooks"] = {  # the guard approves sandboxed shell commands (no log, no delegation rule)
+        "PreToolUse": [{"matcher": "*", "hooks": [_hook([sys.executable, APP / "delegation_guard.py"], 15)]}],
+        "PermissionRequest": [{"matcher": "*", "hooks": [_hook(
+            [sys.executable, APP / "permission_hook.py", c.id, c.token, SERVER_PORT, tout, "chats"], tout + 60)]}]}
+    cmd = [exe, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+           "--include-partial-messages", "--model", c.model,
+           "--append-system-prompt", chat_context(jid),
+           "--settings", json.dumps(s), "--setting-sources", "project",
+           "--permission-mode", "acceptEdits", "--add-dir", str(SHARED),
+           "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+           "--no-session-persistence", "--tools", CHAT_TOOLS]
+    if supports((2, 1, 259)):
+        cmd += ["--permission-prompts", "none"]
+    return cmd
+
+
+def chat_for(cid: str, token: str) -> chatmod.ChatSession:
+    c = next((x for x in CHATS.values() if x.id == cid), None)
+    if not c:
+        raise HTTPException(404, "no such chat")
+    if not token or not hmac.compare_digest(token, c.token):
+        raise HTTPException(403, "bad token")
+    return c
+
+
+def _chat_job(jid: str) -> dict:
+    job = load_job(jid)
+    if job.get("kind") == "selftest":
+        raise HTTPException(400, "self-tests don't have a chat")
+    if job.get("status") in ACTIVE:
+        raise HTTPException(400, "the chat opens once the job has finished")
+    return job
+
+
+@app.get("/api/jobs/{jid}/chat")
+def api_chat_get(jid: str, since: int = 0):
+    load_job(jid)
+    c = CHATS.get(jid)
+    return {"chat": c.view(since) if c else None}
+
+
+@app.post("/api/jobs/{jid}/chat")
+def api_chat_send(jid: str, body: dict):
+    text = str(body.get("message") or "").strip()
+    if not text:
+        raise HTTPException(400, "empty message")
+    _chat_job(jid)
+    with LOCK:
+        c = CHATS.get(jid)
+        if c and c.busy:
+            raise HTTPException(409, "The assistant is still answering. Wait for it, or press Stop.")
+        if not c or c.ended:
+            new = chatmod.ChatSession(jid, chat_model(), carry=c.items if c else None)
+            cmd = chat_command(jid, new)
+            jd = job_dir(jid)
+            new.start(cmd, str(jd / "work"), clean_env(lab_env(jd)))
+            CHATS[jid], c = new, new
+    try:
+        c.send(text)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    return {"ok": True, "id": c.id}
+
+
+@app.post("/api/jobs/{jid}/chat/stop")
+def api_chat_stop(jid: str):
+    c = CHATS.get(jid)
+    if c:
+        try:
+            c.interrupt()
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{jid}/chat/close")
+def api_chat_close(jid: str):
+    """End the chat and forget it (the "New chat" button)."""
+    c = CHATS.pop(jid, None)
+    if c:
+        c.close()
+    return {"ok": True}
+
+
+@app.post("/api/chats/{cid}/permissions")
+def api_chat_perm_create(cid: str, body: dict, token: str = ""):
+    """Called by permission_hook.py for the chat assistant. Kept in memory only."""
+    c = chat_for(cid, token)
+    rec = {"id": uuid.uuid4().hex[:10], "created": time.time(), "status": "pending",
+           "tool_name": str(body.get("tool_name") or "?"), "tool_input": body.get("tool_input"),
+           "summary": short_input(str(body.get("tool_name")), body.get("tool_input"))[:2000], "agent": "chat"}
+    if get_settings().get("auto_allow_permissions"):
+        rec.update(status="allowed", auto=True, decided=time.time(), message="auto-allowed")
+    c.add_perm(rec)
+    return {"id": rec["id"], "status": rec["status"]}
+
+
+@app.get("/api/chats/{cid}/permissions/{rid}")
+def api_chat_perm_get(cid: str, rid: str, token: str = ""):
+    r = chat_for(cid, token).get_perm(rid)
+    if not r:
+        raise HTTPException(404, "no such request")
+    return {"status": r["status"], "message": r.get("message")}
+
+
+@app.post("/api/chats/{cid}/permissions/{rid}/expire")
+def api_chat_perm_expire(cid: str, rid: str, token: str = ""):
+    c = chat_for(cid, token)
+    with c.lock:
+        r = c.get_perm(rid)
+        if r and r["status"] == "pending":
+            r["status"], r["decided"] = "expired", time.time()
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{jid}/chat/permissions/{rid}/decide")
+def api_chat_perm_decide(jid: str, rid: str, body: dict):
+    if body.get("behavior") not in ("allow", "deny"):
+        raise HTTPException(400, "behavior must be allow or deny")
+    c = CHATS.get(jid)
+    r = c.get_perm(rid) if c else None
+    if not r:
+        raise HTTPException(404, "no such request")
+    with c.lock:
+        if r["status"] != "pending":
+            raise HTTPException(400, f"this request is already {r['status']}")
+        r["status"] = "allowed" if body["behavior"] == "allow" else "denied"
+        r["message"] = str(body.get("message") or "")[:1000]
+        r["decided"] = time.time()
+    return {k: v for k, v in r.items() if k != "tool_input"}
+
+
 # Recover jobs that were running when the server stopped
-for p in JOBS.iterdir():
+for p in job_dirs():
     j = read_json(p / "job.json")
     if j and j.get("status") in ACTIVE:
         j["status"] = "interrupted"
