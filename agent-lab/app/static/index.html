@@ -14,6 +14,7 @@
     <button data-tab="topology">Topology</button>
     <button data-tab="jobs">Jobs</button>
     <button data-tab="settings">Settings</button>
+    <button data-tab="dev" title="Describe a change to Agent Lab itself">Modify app</button>
   </nav>
   <label class="autoallow" id="autoallow" title="When on, every permission request from a job is approved immediately. Requests are still listed on the job page and sent as low-priority notifications. Shell commands stay inside the sandbox either way, but file edits outside the lab folder would be allowed.">
     <input type="checkbox" id="autoallow-cb"><span class="switch"></span><span class="lbl">Auto-allow permissions</span>
@@ -31,8 +32,12 @@
         <label>Specification (paste text, or attach a file below)
           <textarea name="spec_text" rows="12" placeholder="What should be built, what data, what to measure…"></textarea>
         </label>
-        <label class="file">Spec file (.pdf, .md, .txt, .tex)
-          <input type="file" name="file" accept=".pdf,.md,.txt,.tex">
+        <label class="file">Spec files: any type, e.g. a PDF, Python pseudocode or a .zip (zips are unpacked for the agents)
+          <input type="file" name="file" multiple>
+        </label>
+        <label>Folders on this Mac the agents may use (optional)
+          <textarea name="access" rows="2" placeholder="e.g. Desktop, or ~/Desktop/my-project (one per line)"></textarea>
+          <span class="muted small">The agents can read and change anything in these folders, so they can work on an existing project. Agent Lab's own files stay protected. Without this, agents only see the job's own workspace.</span>
         </label>
         <div class="prior-box">
           <div class="row"><b class="grow">Build on earlier jobs <span class="muted small">(optional)</span></b>
@@ -99,6 +104,20 @@
     </div>
   </section>
 
+  <!-- MODIFY APP -->
+  <section id="tab-dev" class="tab">
+    <div class="card narrow">
+      <h2>Change Agent Lab itself</h2>
+      <p class="muted">Describe a change to this app: a new feature, a different layout, a fix. One assistant edits a copy of Agent Lab's source code. When it finishes, Agent Lab checks the new code (it must compile, start, and keep the sandbox settings), applies it, and restarts, waiting first until no job is running. It then pushes the change to GitHub if you leave that ticked. You can undo the latest change.</p>
+      <textarea id="dev-text" rows="6" placeholder="e.g. Add a button to each job that downloads its workspace as a zip"></textarea>
+      <div class="row"><label class="check grow"><input type="checkbox" id="dev-push"> Push to GitHub when done <span id="dev-repo" class="muted small"></span></label>
+        <button class="primary" id="dev-go">Make this change</button></div>
+      <div id="dev-msg" class="msg"></div>
+    </div>
+    <div class="card narrow" id="dev-active" hidden></div>
+    <div class="card narrow"><h3>Changes</h3><div id="dev-runs"><p class="muted small">None yet.</p></div></div>
+  </section>
+
   <!-- SETTINGS -->
   <section id="tab-settings" class="tab">
     <div class="card narrow">
@@ -122,19 +141,43 @@
           <label class="small">Default max turns <input name="max_turns" type="number" min="1" placeholder="no limit"></label>
         </div>
         <div class="row">
+          <label class="small">Warn me when Agent Lab uses more than, GB <input name="storage_limit_gb" type="number" min="1" step="any"></label>
+          <label class="small">Pause running jobs when free disk space drops below, GB <input name="min_free_gb" type="number" min="1" step="any"></label>
+        </div>
+        <div class="row">
           <label class="small">Model for analysis &amp; self-improvement <input name="improver_model" placeholder="same as orchestrator"></label>
           <label class="small">Model for the job chat (Ask tab) <input name="chat_model" placeholder="same as analysis"></label>
+          <label class="small">Model for app changes (Modify app tab) <input name="selfdev_model" placeholder="same as the chat"></label>
           <label class="check"><input type="checkbox" name="auto_analyze"> analyze every finished job automatically and draft an improvement</label>
         </div>
         <div class="row">
           <label class="grow">Cluster name, used in the "Make a Slurm version" template <input name="cluster_name" placeholder="e.g. the university GPU cluster"></label>
         </div>
+        <h2>GitHub (for the Modify app tab)</h2>
+        <p class="muted small">After a change made in the Modify app tab is applied, Agent Lab can push it to your GitHub repository. It uses git on this Mac. If git isn't signed in to GitHub here, paste a fine-grained token with <i>Contents: read and write</i> on just that repository. The token stays in Agent Lab's settings on this Mac, and agents can't read it.</p>
+        <div class="row">
+          <label class="grow">Repository <input name="github_repo" placeholder="owner/name"></label>
+          <label class="grow">Token (optional) <input name="github_token" type="password" autocomplete="off" placeholder="only if git isn't signed in"></label>
+        </div>
+        <label class="check"><input type="checkbox" name="auto_push"> push app changes to GitHub by default</label>
+        <label>Never publish these words (comma-separated; your name, username, home folder path, tokens, ntfy topic and cluster name are always blocked)
+          <input name="private_words" placeholder="e.g. a lab name, a server name"></label>
         <div class="row end">
           <button type="button" id="btn-test-notify">Send test notification</button>
           <button type="submit" class="primary">Save settings</button>
         </div>
         <div id="settings-msg" class="msg"></div>
       </form>
+    </div>
+    <div class="card narrow" id="storage-card">
+      <h2>Storage</h2>
+      <div id="storage-body"><p class="muted small">Measuring…</p></div>
+      <div class="row">
+        <button id="btn-storage-scan">Measure again</button>
+        <button id="btn-clean-venvs" title="Each job's Python environment (.venv) can be recreated from the package cache in a minute">Delete virtual environments of finished jobs</button>
+        <button id="btn-clean-uv" title="Removes packages no environment uses any more">Prune the package cache</button>
+      </div>
+      <div id="storage-msg" class="msg"></div>
     </div>
     <div class="card narrow">
       <h2>Sandbox self-test</h2>

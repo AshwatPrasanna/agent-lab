@@ -43,7 +43,7 @@ class ChatSession:
         self.id = uuid.uuid4().hex[:12]
         self.jid, self.model = jid, model
         self.token = secrets.token_hex(16)  # for the permission hook; only ever held in memory
-        self.created = time.time()
+        self.created = self.last_active = time.time()
         self.items: list[dict] = list(carry or [])
         self._n = (self.items[-1]["n"] + 1) if self.items else 0  # running message number
         self.perms: list[dict] = []
@@ -115,7 +115,7 @@ class ChatSession:
                         if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error"):
                             self._add("error", _text(c.get("content"))[:800])
             elif typ == "result":
-                self.busy, self.draft = False, ""
+                self.busy, self.draft, self.last_active = False, "", time.time()
                 self.cost += float(ev.get("total_cost_usd") or 0)
                 if self.interrupted:
                     self._add("note", "Stopped.")
@@ -145,7 +145,7 @@ class ChatSession:
             if self.busy:
                 raise RuntimeError("the assistant is still answering")
             self._add("user", text)
-            self.busy, self.draft = True, ""
+            self.busy, self.draft, self.last_active = True, "", time.time()
             self._write({"type": "user", "message": {"role": "user", "content": text}})
 
     def interrupt(self):

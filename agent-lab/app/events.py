@@ -159,3 +159,70 @@ def transcript_markdown(d: Digest, limit_chars: int = 60000) -> str:
         half = limit_chars // 2
         body = body[:half] + "\n\n... [middle of transcript omitted] ...\n\n" + body[-half:]
     return body
+
+
+# --------------------------------------------------------------------------- keeping logs small
+EVENT_TEXT_LIMIT = 20_000  # characters kept of any one string in a saved event (tool output, file contents…)
+RESULT_TEXT_LIMIT = 200_000  # the final message is kept nearly whole
+
+
+def shrink(obj, limit: int = EVENT_TEXT_LIMIT):
+    """A copy of a Claude Code event with long strings cut down and images left out, for saving.
+    Tool results can be whole files or base64 images; the activity log only needs a few hundred
+    characters of them."""
+    if isinstance(obj, str):
+        if len(obj) <= limit:
+            return obj
+        keep = limit // 2
+        return obj[:keep] + f"\n… [{len(obj) - 2 * keep:,} characters left out of the saved log] …\n" + obj[-keep:]
+    if isinstance(obj, list):
+        return [shrink(x, limit) for x in obj]
+    if isinstance(obj, dict):
+        if obj.get("type") == "image" and isinstance(obj.get("source"), dict):
+            return {"type": "image", "source": {"type": "omitted", "note": "image left out of the saved log"}}
+        return {k: shrink(v, limit) for k, v in obj.items()}
+    return obj
+
+
+def shrink_event(ev: dict) -> dict:
+    return shrink(ev, RESULT_TEXT_LIMIT if ev.get("type") == "result" else EVENT_TEXT_LIMIT)
+
+
+class DigestCache:
+    """Digests of events.jsonl files, updated by reading only the new lines. The job page polls every
+    1.5 s while a job runs, and re-reading the whole log each time made that cost grow with the
+    square of the job's length."""
+
+    def __init__(self, size: int = 8):
+        import threading
+        from collections import OrderedDict
+        self.size, self.lock, self.entries = size, threading.Lock(), OrderedDict()
+
+    def get(self, path: Path) -> Digest:
+        key = str(path)
+        with self.lock:
+            try:
+                st = path.stat()
+            except OSError:
+                self.entries.pop(key, None)
+                return Digest()
+            ent = self.entries.get(key)
+            if not ent or ent["ino"] != st.st_ino or st.st_size < ent["offset"]:
+                ent = {"digest": Digest(), "offset": 0, "ino": st.st_ino, "rest": b""}
+            if st.st_size > ent["offset"]:
+                with path.open("rb") as f:
+                    f.seek(ent["offset"])
+                    data = ent["rest"] + f.read(st.st_size - ent["offset"])
+                ent["offset"] = st.st_size
+                lines = data.split(b"\n")
+                ent["rest"] = lines.pop()  # a line still being written
+                for line in lines:
+                    try:
+                        ent["digest"].feed(json.loads(line))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+            self.entries[key] = ent
+            self.entries.move_to_end(key)
+            while len(self.entries) > self.size:
+                self.entries.popitem(last=False)
+            return ent["digest"]

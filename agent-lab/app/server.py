@@ -26,8 +26,10 @@ import presets
 import prior
 import procs
 import rules
+import selfdev
+import storage
 import topology
-from events import load_digest, transcript_markdown
+from events import DigestCache, load_digest, shrink_event, transcript_markdown
 
 LAB = Path(__file__).resolve().parent.parent
 APP = LAB / "app"
@@ -59,9 +61,14 @@ ACTIVE = ("running", "queued", "paused", "cancelling")
 DEFAULT_SETTINGS = {"ntfy_server": "https://ntfy.sh", "ntfy_topic": "", "ntfy_token": "",
                     "notify_on": ["done", "failed", "timed_out"], "max_turns": None, "improver_model": "",
                     "time_limit_min": 120, "permission_timeout_min": 30, "auto_analyze": True,
-                    "auto_allow_permissions": False, "cluster_name": "", "chat_model": ""}
+                    "auto_allow_permissions": False, "cluster_name": "", "chat_model": "",
+                    "selfdev_model": "", "github_repo": "", "github_token": "", "auto_push": True, "private_words": "",
+                    "storage_limit_gb": 15, "min_free_gb": 3}
+SECRET_SETTINGS = ("ntfy_token", "github_token")  # never sent back to the page
+SECRET_MASK = "••••••••"
 
-app = App(static_dir=Path(__file__).resolve().parent / "static")
+app = App(static_dir=Path(__file__).resolve().parent / "static", upload_dir=LAB / "runtime" / "uploads")
+DIGESTS = DigestCache(8)
 
 
 def code_hash() -> str:
@@ -94,9 +101,18 @@ def job_dirs():
 
 
 def write_json(p: Path, obj):
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=2))
-    tmp.replace(p)
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.", suffix=".tmp")  # O_EXCL: never follows a link
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(obj, indent=2))
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def get_settings() -> dict:
@@ -290,11 +306,15 @@ def _hook(cmd: list[str], timeout: int) -> dict:
     return {"type": "command", "command": " ".join(shlex.quote(str(x)) for x in cmd), "timeout": timeout}
 
 
-def sandbox_settings(jd: Optional[Path] = None, delegation: bool = False, job_id: Optional[str] = None) -> dict:
+def sandbox_settings(jd: Optional[Path] = None, delegation: bool = False, job_id: Optional[str] = None,
+                     access: Optional[list] = None) -> dict:
     """Claude Code settings for every job: OS sandbox on, no escape hatch, reads fenced to the workspace.
     With jd: the guard hook (approves sandboxed shell commands, enforces delegation) and the
-    permission hook (forwards anything that needs approval to this app)."""
-    s = _base_sandbox_settings()
+    permission hook (forwards anything that needs approval to this app).
+    With access: the extra folders the user granted to this job (see apply_access)."""
+    s = _base_sandbox_settings(job_id or (jd.name if jd is not None else None))
+    if jd is not None and access:
+        apply_access(s, jd, access)
     if jd is not None:
         guard = [sys.executable, APP / "delegation_guard.py", "--log", jd / "guard.jsonl"] + (["--delegation"] if delegation else [])
         hooks = {"PreToolUse": [{"matcher": "*", "hooks": [_hook(guard, 15)]}]}
@@ -306,7 +326,12 @@ def sandbox_settings(jd: Optional[Path] = None, delegation: bool = False, job_id
     return s
 
 
-def _base_sandbox_settings() -> dict:
+def gpu_prefix(job_id: str) -> str:
+    """How agents of this job call the GPU launcher (the only form exempted from Claude Code's sandbox)."""
+    return f"{LAB_GPU} --job {job_id}"
+
+
+def _base_sandbox_settings(gpu_job: Optional[str] = None) -> dict:
     return {
         "autoMemoryEnabled": False,  # otherwise Claude Code writes notes to ~/.claude/projects/<job>/memory
         "permissions": {
@@ -324,13 +349,113 @@ def _base_sandbox_settings() -> dict:
             "autoAllowBashIfSandboxed": True,
             # The GPU launcher runs outside Claude Code's sandbox but applies its own profile
             # (app/sandbox/gpu.sb). Agents can't edit app/, so they can't change what it allows.
-            "excludedCommands": [f"{LAB_GPU} *"],
+            "excludedCommands": [f"{gpu_prefix(gpu_job)} *"] if gpu_job else [],
             "credentials": {
                 "files": [{"path": p, "mode": "deny"} for p in
                           ("~/.ssh", "~/.aws", "~/.kaggle", "~/.config/gh", "~/.netrc", "~/.docker", "~/.gnupg")],
             },
         },
     }
+
+
+# --------------------------------------------------------------------------- extra folders granted to a job
+# A job (and its Ask chat) can be given read/write access to folders on this Mac, e.g. the Desktop.
+# Agent Lab's own files stay protected even when a granted folder contains them: its code, settings
+# (tokens), runtime files, other jobs, this job's records, and the Agent Lab icon.
+NOT_GRANTABLE = {".ssh", ".aws", ".gnupg", ".config", ".kaggle", ".docker", ".netrc", "Library", ".claude",
+                 ".claude.json", ".Trash"}
+OWN_JOB_FILES = ("job.json", "settings.json", "system_prompt.md", "subagent_prompt.md", "agents.json",
+                 "command.json", "events.jsonl", "stderr.log", "guard.jsonl", "metrics.json", "permissions.json",
+                 "perm_token", "selftest_config.json", "analysis", "improve")
+
+
+def parse_access(raw) -> list[str]:
+    """'Desktop', '~/Documents/x' or '/Users/me/x', one per line or comma-separated -> checked absolute paths."""
+    home = Path.home().resolve()
+    out = []
+    for item in (x.strip() for x in re.split(r"[\n,]", str(raw or ""))):
+        if not item:
+            continue
+        p = Path(os.path.expanduser(item))
+        if not p.is_absolute():
+            p = home / item
+        try:
+            p = p.resolve(strict=True)
+        except OSError:
+            raise HTTPException(400, f"Folder not found: {item}")
+        if not p.is_dir():
+            raise HTTPException(400, f"Not a folder: {item}")
+        if p == home or home not in p.parents:
+            raise HTTPException(400, f"{item}: only folders inside your home folder can be granted, not the home folder itself")
+        if p.relative_to(home).parts[0] in NOT_GRANTABLE:
+            raise HTTPException(400, f"{item}: that folder holds credentials or system data, so it can't be granted")
+        for own in (APP, CONFIG, LAB / "runtime"):
+            if p == own or own in p.parents:
+                raise HTTPException(400, f"{item}: that's part of Agent Lab itself")
+        if re.search(r'["\\#&\n\r]', str(p)):
+            raise HTTPException(400, f"{item}: folder names with \" \\ # or & aren't supported")
+        if str(p) not in out:
+            out.append(str(p))
+    return out
+
+
+def protected_paths(jd: Path) -> tuple[list[str], list[str]]:
+    """(no writing, no reading) paths that stay off-limits inside granted folders."""
+    write = [APP, CONFIG, LAB / "runtime", LAB / "README.md", LAB / "start.command", LAB / "setup.command",
+             LAB / "restore-app.command", LAB / ".gitignore", LAB.parent / "Agent Lab.app"]
+    write += sorted(p for p in JOBS.iterdir() if p.name != jd.name)  # every other job
+    own = set(OWN_JOB_FILES) | {x.name for x in jd.iterdir()}
+    write += [jd / x for x in sorted(own - {"work"})]  # this job's records (not its workspace)
+    return [str(x) for x in write], [str(CONFIG), str(LAB / "runtime")]
+
+
+def apply_access(s: dict, jd: Path, access: list):
+    write, read = protected_paths(jd)
+    fs = s["sandbox"].setdefault("filesystem", {})
+    fs["allowWrite"] = list(access)
+    fs["denyWrite"] = write  # takes precedence over allowWrite
+    fs["denyRead"] = read
+    deny = s["permissions"]["deny"]
+    for p in write:  # the same rules for the file tools ("//" = an absolute path)
+        deny += [f"Edit(/{p})", f"Edit(/{p}/**)"]
+    for p in read:
+        deny += [f"Read(/{p})", f"Read(/{p}/**)"]
+
+
+ACCESS_DIR = LAB / "runtime" / "access"
+
+
+def write_access_file(jid: str, access: Optional[list]):
+    """The folders granted to a job. Kept in runtime/, which agents can neither read nor write, and read
+    by app/bin/lab-gpu and when the job or its chat starts (job.json's copy is only for display)."""
+    ACCESS_DIR.mkdir(parents=True, exist_ok=True)
+    (ACCESS_DIR / f"{jid}.txt").write_text("".join(f"{p}\n" for p in (access or [])))
+
+
+def read_access(jid: str) -> list:
+    """The job's granted folders, each checked again."""
+    try:
+        lines = (ACCESS_DIR / f"{jid}.txt").read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            out += [p for p in parse_access(line) if p not in out]
+        except HTTPException:
+            pass  # e.g. the folder was deleted since
+    return out
+
+
+def access_note(access: Optional[list]) -> str:
+    if not access:
+        return ""
+    return ("\n\nYou also have read and write access to these folders on the user's computer:\n"
+            + "\n".join(f"- {p}" for p in access)
+            + "\nWork on files there only as the user asks. Everything else in them belongs to the user: don't delete, "
+              "move or reorganize anything you weren't asked to touch. Agent Lab's own files stay off-limits even inside "
+              "these folders. To use the GPU on code there, run the GPU launcher from this workspace and give the "
+              "script's absolute path.")
 
 
 def perm_token(jd: Path) -> str:
@@ -343,7 +468,7 @@ def perm_token(jd: Path) -> str:
 
 def runtime_rules(job: dict) -> str:
     lim = job.get("time_limit_min")
-    return (rules.RUNTIME_RULES.replace("{LAB_GPU}", LAB_GPU)
+    return (rules.RUNTIME_RULES.replace("{LAB_GPU}", gpu_prefix(job["id"]))
             .replace("{TIME_LIMIT}", f"{lim} minutes (time spent paused doesn't count)" if lim else "none set"))
 
 
@@ -357,7 +482,8 @@ def build_command(job: dict, cfg: dict, prompt: str, jd: Path) -> list[str]:
     sub_append = (comp["subagent_append"] + "\n\n" + rr).strip()
     (jd / "subagent_prompt.md").write_text(sub_append)
     write_json(jd / "agents.json", comp["agents"])
-    write_json(jd / "settings.json", sandbox_settings(jd, comp["require_delegation"], job["id"]))
+    access = read_access(job["id"])
+    write_json(jd / "settings.json", sandbox_settings(jd, comp["require_delegation"], job["id"], access))
     union = set(["TodoWrite"])
     for n in cfg["nodes"]:
         union.update(n.get("tools") or [])
@@ -370,7 +496,7 @@ def build_command(job: dict, cfg: dict, prompt: str, jd: Path) -> list[str]:
            "--settings", str(jd / "settings.json"),
            "--setting-sources", "project",
            "--permission-mode", "acceptEdits",
-           "--add-dir", str(SHARED),
+           "--add-dir", str(SHARED), *[a for p in access for a in ("--add-dir", p)],
            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
            "--no-session-persistence",
            "--tools", ",".join(sorted(union))]
@@ -425,9 +551,9 @@ def run_process(jid: str, cmd: list[str], cwd: Path, env: dict, events_path: Pat
                 if not line:
                     continue
                 try:
-                    rec = {"ts": time.time(), "ev": json.loads(line)}
+                    rec = {"ts": time.time(), "ev": shrink_event(json.loads(line))}
                 except json.JSONDecodeError:
-                    rec = {"ts": time.time(), "raw": line}
+                    rec = {"ts": time.time(), "raw": line[:20000]}
                 out.write(json.dumps(rec) + "\n")
                 out.flush()
             return proc.wait()
@@ -471,10 +597,14 @@ def run_job(jid: str):
                        "and the relevant `_JOB.md` files, and reuse the code and results that work rather than starting over. "
                        "These are copies, so the original jobs are never affected. Put this job's own deliverables in the "
                        "workspace root, not inside prior/.")
+        if job.get("spec_files"):
+            prompt += ("\n\nThe user attached files to the spec. They're in ./spec_files/ and listed in the spec "
+                       "(zips are already unpacked next to them).")
+        prompt += access_note(read_access(jid))
         if job.get("notes"):
             prompt += f"\n\nAdditional notes from the user:\n{job['notes']}"
         if job.get("kind") == "selftest":
-            prompt = selftest_prompt()
+            prompt = selftest_prompt(job)
         cmd = build_command(job, cfg, prompt, jd)
         if job.get("kind") == "selftest":
             cmd += ["--json-schema", json.dumps(rules.SELFTEST_SCHEMA)]
@@ -505,7 +635,8 @@ def run_job(jid: str):
             tail = (jd / "stderr.log").read_text()[-1500:] if (jd / "stderr.log").exists() else ""
             job["error"] = (d.result or {}).get("subtype") or tail or f"exit code {rc}"
         if job.get("kind") == "selftest":
-            job["selftest"] = evaluate_selftest(d, jd)
+            job["selftest"] = evaluate_selftest(d, jd, job)
+            shutil.rmtree(SELFTEST_DECOY, ignore_errors=True)
     except Exception as e:  # noqa: BLE001
         job = load_job(jid)
         job["status"] = "failed"
@@ -513,6 +644,7 @@ def run_job(jid: str):
     job["finished"] = time.time()
     expire_pending(jd)
     save_job(job)
+    STORAGE["event"].set()  # measure disk use again
     s = get_settings()
     if job["status"] in s.get("notify_on", []):
         m = read_json(jd / "metrics.json", {}) or {}
@@ -545,9 +677,39 @@ def experiment_python() -> str:
     return str(c[-1]) if c else "python3"
 
 
-def selftest_prompt() -> str:
-    return rules.SELFTEST_PROMPT.format(PY=experiment_python(), METAL=rules.METAL_CHECK, LAB_GPU=LAB_GPU,
+SELFTEST_DECOY = JOBS / "zz-selftest-decoy"  # stands in for "another job" in the granted-folder checks
+
+
+def selftest_grant() -> Optional[Path]:
+    """The folder that contains the lab (e.g. the Desktop), if it can be granted."""
+    try:
+        return Path(parse_access(str(LAB.parent))[0])
+    except (HTTPException, IndexError):
+        return None
+
+
+def selftest_prompt(job: dict) -> str:
+    text = rules.SELFTEST_PROMPT.format(PY=experiment_python(), METAL=rules.METAL_CHECK, LAB_GPU=gpu_prefix(job["id"]),
                                         HOME=str(Path.home()), APP=str(APP), PORT=SERVER_PORT)
+    if job.get("access"):
+        extra = rules.SELFTEST_GRANT_CHECKS.format(GRANT=job["access"][0], APP=str(APP), LAB=str(LAB),
+                                                   DECOY=str(SELFTEST_DECOY), LAB_GPU=gpu_prefix(job["id"]))
+        text = text.replace("For each check, report outcome:", extra + "For each check, report outcome:", 1)
+    return text
+
+
+def selftest_expect(job: dict) -> dict:
+    return {**rules.SELFTEST_EXPECT, **(rules.SELFTEST_GRANT_EXPECT if job.get("access") else {})}
+
+
+def selftest_probes(job: dict) -> dict:
+    probes = dict(PROBES)
+    if job.get("access"):
+        g = Path(job["access"][0])
+        probes.update(grant_write=g / "agent-lab-grant-probe.txt", grant_write_app=APP / "grant-probe",
+                      grant_edit_app=APP / "edit-probe.txt", grant_write_other_job=SELFTEST_DECOY / "probe",
+                      gpu_grant_write=g / "agent-lab-gpu-grant-probe")
+    return probes
 
 
 PROBES = {"write_home": Path.home() / "agent-lab-sandbox-probe",
@@ -555,7 +717,9 @@ PROBES = {"write_home": Path.home() / "agent-lab-sandbox-probe",
           "gpu_write_app": APP / "gpu-probe"}
 
 
-def evaluate_selftest(d, jd: Path) -> dict:
+def evaluate_selftest(d, jd: Path, job: Optional[dict] = None) -> dict:
+    job = job or load_job(jd.name)
+    probes = selftest_probes(job)
     so = (d.result or {}).get("structured_output") or {}
     if not so and d.result:
         try:
@@ -564,11 +728,11 @@ def evaluate_selftest(d, jd: Path) -> dict:
             so = {}
     reported = {c.get("id"): c for c in so.get("checks", [])}
     rows = []
-    for cid, want in rules.SELFTEST_EXPECT.items():
+    for cid, want in selftest_expect(job).items():
         got = reported.get(cid, {}).get("outcome", "missing")
         ev = reported.get(cid, {}).get("evidence", "")
-        if cid in PROBES:  # verified independently of what the model reports
-            probe = PROBES[cid]
+        if cid in probes:  # verified independently of what the model reports
+            probe = probes[cid]
             escaped = probe.exists()
             if escaped:
                 try:
@@ -576,7 +740,11 @@ def evaluate_selftest(d, jd: Path) -> dict:
                 except OSError:
                     pass
             got = "allowed" if escaped else "blocked"
-            ev = (f"a file appeared at {probe}!" if escaped else f"verified: nothing was created at {probe}") + (" · " + ev if ev else "")
+            seen = (f"verified: the file was created at {probe}" if want == "allowed" else f"a file appeared at {probe}!") \
+                if escaped else f"verified: nothing was created at {probe}"
+            ev = seen + (" · " + ev if ev else "")
+        if cid in ("grant_read_config", "grant_read_tool_config", "gpu_grant_read_config") and "ntfy_server" in ev:
+            got = "allowed"  # the agent's evidence quotes Agent Lab's settings file, so it could read it
         if cid == "write_workspace" and (jd / "work" / "probe.txt").exists():
             got = "allowed"
         if cid in ("gpu_in_sandbox", "gpu_launcher"):
@@ -764,8 +932,16 @@ def api_status(refresh: bool = False):
             pending += [{"job": j["id"], "title": j["title"]} for r in load_perms(p) if r["status"] == "pending"]
     for c in list(CHATS.values()):
         pending += [{"job": c.jid, "title": "chat", "chat": True} for r in c.perms if r["status"] == "pending"]
+    if DEV["session"]:
+        pending += [{"job": None, "title": "app change", "selfdev": True} for r in DEV["session"].perms if r["status"] == "pending"]
     st["pending_permissions"] = pending
     st["auto_allow_permissions"] = bool(get_settings().get("auto_allow_permissions"))
+    last, s = STORAGE["last"], get_settings()
+    if last:
+        st["storage"] = {"total": last["total"], "limit_gb": s.get("storage_limit_gb"),
+                         "over": last["total"] > float(s.get("storage_limit_gb") or 15) * 1e9,
+                         "free": shutil.disk_usage(str(LAB)).free,
+                         "free_low": shutil.disk_usage(str(LAB)).free < float(s.get("min_free_gb") or 3) * 1e9}
     st["code"] = {"running": BOOT_HASH, "on_disk": code_hash(), "started": BOOT_TIME}
     st["code_stale"] = st["code"]["running"] != st["code"]["on_disk"]
     return st
@@ -804,28 +980,41 @@ def api_restart(body: dict):
     if running and not body.get("force"):
         raise HTTPException(409, f"{len(running)} job(s) still running; restarting would stop them")
 
+    restart_server()
+    return {"ok": True}
+
+
+def restart_server(delay: float = 0.7):
+    """Restart in place (same process id, same log) to load updated code."""
     def later():
-        time.sleep(0.7)
+        time.sleep(delay)
         print("Agent Lab: restarting to load updated code", flush=True)
         close_all_chats()
         os.execv(sys.executable, [sys.executable] + sys.argv)
     threading.Thread(target=later, daemon=True).start()
-    return {"ok": True}
 
 
 @app.get("/api/settings")
 def api_get_settings():
-    return get_settings()
+    s = get_settings()
+    for k in SECRET_SETTINGS:
+        s[k] = SECRET_MASK if s.get(k) else ""
+    return s
 
 
 @app.post("/api/settings")
 def api_set_settings(body: dict):
     s = get_settings()
     for k in DEFAULT_SETTINGS:
-        if k in body:
+        if k in body and not (k in SECRET_SETTINGS and body[k] == SECRET_MASK):  # the mask means "unchanged"
             s[k] = body[k]
     if s.get("ntfy_topic") and not re.match(r"^[A-Za-z0-9_-]{1,64}$", s["ntfy_topic"]):
         raise HTTPException(400, "ntfy topic: letters, digits, - and _ only")
+    for k, lo in (("storage_limit_gb", 1), ("min_free_gb", 1)):
+        try:
+            s[k] = max(lo, float(s.get(k) if s.get(k) not in ("", None) else DEFAULT_SETTINGS[k]))
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{k} must be a number")
     for k in ("time_limit_min", "permission_timeout_min", "max_turns"):
         if s.get(k) in ("", None):
             s[k] = None if k != "permission_timeout_min" else 30
@@ -835,15 +1024,19 @@ def api_set_settings(body: dict):
             except (TypeError, ValueError):
                 raise HTTPException(400, f"{k} must be a whole number")
     s["auto_allow_permissions"] = bool(s.get("auto_allow_permissions"))
+    s["auto_push"] = bool(s.get("auto_push"))
+    s["github_repo"] = str(s.get("github_repo") or "").strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
+    if s["github_repo"] and not re.fullmatch(r"[\w.-]+/[\w.-]+", s["github_repo"]):
+        raise HTTPException(400, "GitHub repository: use the form owner/name")
     write_json(SETTINGS_FILE, s)
     if s["auto_allow_permissions"]:
         approve_all_pending()
-    return s
+    return api_get_settings()
 
 
 def approve_all_pending():
     """Auto-allow was switched on: approve anything already waiting in running jobs and chats."""
-    for c in list(CHATS.values()):
+    for c in list(CHATS.values()) + ([DEV["session"]] if DEV["session"] else []):
         with c.lock:
             for r in c.perms:
                 if r["status"] == "pending":
@@ -931,22 +1124,107 @@ def api_compiled():
     return topology.compile_config(load_version(current_version())["config"])
 
 
+SPEC_DOC_EXT = (".pdf", ".md", ".txt", ".tex")
+
+
+def safe_name(name: str) -> str:
+    base = Path(str(name).replace("\\", "/")).name
+    base = re.sub(r"[^\w.\- ()+@,]", "_", base).strip(" .") or "file"
+    return base[:150]
+
+
+def _put(f: dict, dest: Path):
+    """Move an uploaded file (streamed to disk by webkit) into place."""
+    if f.get("path"):
+        shutil.move(f["path"], dest)
+    else:
+        dest.write_bytes(f["data"])
+
+
+def extract_zip(zpath: Path, dest: Path, max_bytes: int = 4 * 2**30, max_files: int = 50000) -> str:
+    """Unpack a zip the user attached. Skips absolute paths, '..', symlinks and macOS metadata.
+    Refuses a zip whose contents wouldn't fit (a "zip bomb", or just a full disk)."""
+    import stat
+    import zipfile
+    n = total = 0
+    try:
+        with zipfile.ZipFile(zpath) as z:
+            declared = sum(i.file_size for i in z.infolist())
+            room = shutil.disk_usage(str(dest.parent)).free - int(float(get_settings().get("min_free_gb") or 3) * 2**30)
+            if declared > min(max_bytes, room):
+                return (f"not unpacked: its contents are {storage.fmt(declared)}, more than "
+                        + ("the 4 GB limit" if declared > max_bytes else "the free disk space allows"))
+            for info in z.infolist():
+                name = info.filename.replace("\\", "/")
+                parts = [x for x in name.split("/") if x not in ("", ".")]
+                if (not parts or ".." in parts or name.startswith("/") or ":" in parts[0]
+                        or parts[0] == "__MACOSX" or parts[-1] == ".DS_Store"):
+                    continue
+                if stat.S_ISLNK(info.external_attr >> 16):
+                    continue
+                target = dest.joinpath(*parts)
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                n, total = n + 1, total + info.file_size
+                if n > max_files or total > max_bytes:
+                    return "only partly unpacked: it's too big to unpack automatically"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(info) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+    except (zipfile.BadZipFile, OSError, RuntimeError) as e:
+        return f"couldn't be unpacked ({e})"
+    return ""
+
+
+def save_spec(job: dict, work: Path, spec_text: str, files: list):
+    """A lone PDF/Markdown/text/TeX file stays ./spec.<ext> as before. Anything else (any file type,
+    several files, or text plus files) goes to ./spec_files/, with ./spec.md holding the text and a list."""
+    if len(files) == 1 and not spec_text.strip() and Path(files[0]["filename"]).suffix.lower() in SPEC_DOC_EXT:
+        name = "spec" + Path(files[0]["filename"]).suffix.lower()
+        _put(files[0], work / name)
+        job["spec_file"] = name
+        return
+    text = spec_text.strip() or "The specification is in the attached files listed below."
+    saved, lines = [], []
+    if files:
+        sf = work / "spec_files"
+        sf.mkdir(exist_ok=True)
+        for f in files:
+            fn = safe_name(f["filename"])
+            stem, ext, i = Path(fn).stem, Path(fn).suffix, 2
+            while (sf / fn).exists():
+                fn, i = f"{stem}-{i}{ext}", i + 1
+            _put(f, sf / fn)
+            saved.append(fn)
+            line = f"- `spec_files/{fn}`"
+            if fn.lower().endswith(".zip"):
+                dest = sf / Path(fn).stem
+                problem = extract_zip(sf / fn, dest)
+                line += f" (a zip: {problem})" if problem else f" (a zip, already unpacked into `spec_files/{dest.name}/`)"
+            lines.append(line)
+        text += "\n\n## Files attached to the spec\n" + "\n".join(lines) + "\n"
+    (work / "spec.md").write_text(text + ("\n" if not text.endswith("\n") else ""))
+    job["spec_file"] = "spec.md"
+    if saved:
+        job["spec_files"] = saved
+
+
 @app.post("/api/jobs")
 def api_create_job(form: dict):
     title, spec_text = form.get("title", ""), form.get("spec_text", "")
     notes, max_turns = form.get("notes", ""), str(form.get("max_turns", ""))
     tl = str(form.get("time_limit_min", "")).strip()
-    file = form.get("file") if isinstance(form.get("file"), dict) else None
-    if file and not file.get("filename"):
-        file = None
+    files = [f for f in ((form.get("_files") or {}).get("file") or [])
+             if isinstance(f, dict) and f.get("filename") and (f.get("path") or f.get("data") is not None)]
     if not find_claude():
         raise HTTPException(400, "Claude Code CLI not found on this Mac")
-    if not spec_text.strip() and not file:
+    if not spec_text.strip() and not files:
         raise HTTPException(400, "Give a specification (text or a file)")
-    ext = Path(file["filename"]).suffix.lower() if file else ".md"
-    if ext not in (".pdf", ".md", ".txt", ".tex"):
-        raise HTTPException(400, "spec file must be .pdf, .md, .txt or .tex")
     extra = {"time_limit_min": int(tl)} if tl.isdigit() and int(tl) > 0 else {}
+    access = parse_access(form.get("access", ""))
+    if access:
+        extra["access"] = access
     want = str(form.get("prior", "")).strip()
     if want:
         usable = [j["id"] for j in api_jobs() if j.get("kind") != "selftest" and j.get("status") not in ACTIVE]
@@ -957,16 +1235,8 @@ def api_create_job(form: dict):
         if ids:
             extra["prior"] = ids
     job = new_job(title, max_turns=int(max_turns) if max_turns.strip().isdigit() else None, notes=notes.strip(), **extra)
-    work = job_dir(job["id"]) / "work"
-    name = "spec" + ext
-    if file:
-        (work / name).write_bytes(file["data"])
-        if spec_text.strip():
-            (work / "spec_notes.md").write_text(spec_text)
-            job["notes"] = (job["notes"] + "\n\nMore spec text is in ./spec_notes.md").strip()
-    else:
-        (work / name).write_text(spec_text)
-    job["spec_file"] = name
+    write_access_file(job["id"], access)
+    save_spec(job, job_dir(job["id"]) / "work", spec_text, files)
     save_job(job)
     threading.Thread(target=run_job, args=(job["id"],), daemon=True).start()
     return job
@@ -976,7 +1246,15 @@ def api_create_job(form: dict):
 def api_selftest():
     if not find_claude():
         raise HTTPException(400, "Claude Code CLI not found on this Mac")
-    job = new_job("Sandbox self-test", kind="selftest", max_turns=40, time_limit_min=15)
+    grant = selftest_grant()
+    extra = {}
+    if grant:
+        extra["access"] = [str(grant)]
+        SELFTEST_DECOY.mkdir(exist_ok=True)
+        if not SETTINGS_FILE.exists():
+            write_json(SETTINGS_FILE, get_settings())
+    job = new_job("Sandbox self-test", kind="selftest", max_turns=60, time_limit_min=20, **extra)
+    write_access_file(job["id"], extra.get("access"))
     (job_dir(job["id"]) / "work" / "spec.md").write_text("Sandbox self-test")
     # self-test runs with a solo topology so it is quick
     solo = presets.get_preset("solo")
@@ -1006,7 +1284,7 @@ def api_jobs():
 def api_job(jid: str, since: int = 0):
     jd = job_dir(jid)
     job = load_job(jid)
-    d = load_digest(jd / "events.jsonl")
+    d = DIGESTS.get(jd / "events.jsonl")
     m = read_json(jd / "metrics.json") or d.metrics(end_ts=time.time())
     m = dict(m)
     m["guard"] = guard_summary(jd)
@@ -1217,10 +1495,30 @@ def close_all_chats():
         c = CHATS.pop(jid, None)
         if c:
             c.close(wait=True)
+    if DEV.get("session"):
+        DEV["session"].close(wait=True)
 
 
 import atexit  # noqa: E402
 atexit.register(close_all_chats)
+
+
+MAX_LIVE_CHATS = 3  # each open chat is a Claude Code process using a few hundred MB of memory
+
+
+def make_room_for_chat(jid: str):
+    """End the least recently used idle chat if too many are open. Its messages stay on its page."""
+    live = [c for k, c in CHATS.items() if k != jid and not c.ended]
+    if len(live) < MAX_LIVE_CHATS:
+        return
+    idle = sorted((c for c in live if not c.busy), key=lambda c: c.last_active)
+    if not idle:
+        raise HTTPException(409, f"{len(live)} Ask chats are busy answering. Wait for one to finish.")
+    old = idle[0]
+    with old.lock:
+        old._add("note", f"This chat's session was ended to save memory (at most {MAX_LIVE_CHATS} chats stay open). "
+                         "Send a message to start a new session. It won't remember the messages above.")
+    old.close()
 
 
 def chat_model() -> str:
@@ -1249,7 +1547,7 @@ def chat_context(jid: str) -> str:
     job = load_job(jid)
     d = load_digest(jd / "events.jsonl")
     m = read_json(jd / "metrics.json") or d.metrics(end_ts=job.get("finished"))
-    parts = [rules.CHAT_PROMPT.replace("{LAB_GPU}", LAB_GPU), "",
+    parts = [rules.CHAT_PROMPT.replace("{LAB_GPU}", gpu_prefix(jid)), "",
              "# The job this chat is about", "",
              f"- title: {job.get('title')}", f"- job id: {jid}",
              f"- status: {job.get('status')}" + (f" ({job.get('error')})" if job.get("error") and job.get("status") != "done" else ""),
@@ -1260,6 +1558,10 @@ def chat_context(jid: str) -> str:
         parts.append(f"- the user's notes for the run: {job['notes']}")
     if job.get("prior"):
         parts.append(f"- built on earlier jobs (copies in ./prior/): {', '.join(job['prior'])}")
+    if job.get("spec_files"):
+        parts.append(f"- files the user attached to the spec (in ./spec_files/): {', '.join(job['spec_files'])}")
+    if read_access(jid):
+        parts.append(access_note(read_access(jid)).strip())
     dg = job.get("diagnosis") or {}
     if dg.get("status") == "ready":
         parts += ["", "## Agent Lab's analysis of the run", dg.get("headline", "")]
@@ -1276,8 +1578,11 @@ def chat_command(jid: str, c: chatmod.ChatSession) -> list[str]:
     exe = find_claude()
     if not exe:
         raise HTTPException(400, "Claude Code CLI not found on this Mac")
-    s = _base_sandbox_settings()
+    s = _base_sandbox_settings(jid)
     s["permissions"]["allow"] = ["Bash", "WebFetch", "WebSearch", "WebFetch(domain:*)"]
+    access = read_access(jid)
+    if access:
+        apply_access(s, job_dir(jid), access)
     tout = int(get_settings().get("permission_timeout_min") or 30) * 60
     s["hooks"] = {  # the guard approves sandboxed shell commands (no log, no delegation rule)
         "PreToolUse": [{"matcher": "*", "hooks": [_hook([sys.executable, APP / "delegation_guard.py"], 15)]}],
@@ -1287,7 +1592,7 @@ def chat_command(jid: str, c: chatmod.ChatSession) -> list[str]:
            "--include-partial-messages", "--model", c.model,
            "--append-system-prompt", chat_context(jid),
            "--settings", json.dumps(s), "--setting-sources", "project",
-           "--permission-mode", "acceptEdits", "--add-dir", str(SHARED),
+           "--permission-mode", "acceptEdits", "--add-dir", str(SHARED), *[a for p in access for a in ("--add-dir", p)],
            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
            "--no-session-persistence", "--tools", CHAT_TOOLS]
     if supports((2, 1, 259)):
@@ -1296,7 +1601,7 @@ def chat_command(jid: str, c: chatmod.ChatSession) -> list[str]:
 
 
 def chat_for(cid: str, token: str) -> chatmod.ChatSession:
-    c = next((x for x in CHATS.values() if x.id == cid), None)
+    c = next((x for x in list(CHATS.values()) + [DEV["session"]] if x and x.id == cid), None)
     if not c:
         raise HTTPException(404, "no such chat")
     if not token or not hmac.compare_digest(token, c.token):
@@ -1331,6 +1636,7 @@ def api_chat_send(jid: str, body: dict):
         if c and c.busy:
             raise HTTPException(409, "The assistant is still answering. Wait for it, or press Stop.")
         if not c or c.ended:
+            make_room_for_chat(jid)
             new = chatmod.ChatSession(jid, chat_model(), carry=c.items if c else None)
             cmd = chat_command(jid, new)
             jd = job_dir(jid)
@@ -1411,6 +1717,517 @@ def api_chat_perm_decide(jid: str, rid: str, body: dict):
     return {k: v for k, v in r.items() if k != "tool_input"}
 
 
+# --------------------------------------------------------------------------- the "Modify app" tab: Agent Lab changing itself
+# One session at a time edits a copy of the app (runtime/selfdev/<id>/work, laid out like the GitHub
+# repository). When it finishes, Agent Lab checks the new code, applies it (keeping a backup), restarts,
+# and, after the restarted app is up, pushes it to GitHub if asked. See selfdev.py.
+SELFDEV_DIR = LAB / "runtime" / "selfdev"
+DEV: dict = {"session": None, "rid": None, "poller": False}
+DEV_LOCK = threading.RLock()
+PUSH_LOCK = threading.Lock()
+IN_PROGRESS = ("running", "checking", "waiting", "applying", "restarting", "undo_restarting")
+
+
+def dev_dir(rid: str) -> Path:
+    if not re.match(r"^[a-z0-9-]+$", rid):
+        raise HTTPException(400, "bad id")
+    return SELFDEV_DIR / rid
+
+
+def load_dev(rid: str) -> dict:
+    rec = read_json(dev_dir(rid) / "record.json")
+    if not rec:
+        raise HTTPException(404, "no such change")
+    return rec
+
+
+def save_dev(rec: dict):
+    with DEV_LOCK:
+        write_json(dev_dir(rec["id"]) / "record.json", rec)
+
+
+def dev_records() -> list[dict]:
+    if not SELFDEV_DIR.exists():
+        return []
+    out = [read_json(p / "record.json") for p in sorted(SELFDEV_DIR.iterdir(), reverse=True) if p.is_dir()]
+    return [r for r in out if r]
+
+
+def dev_last_applied() -> Optional[str]:
+    try:
+        return (SELFDEV_DIR / "LAST_APPLIED").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def selfdev_command(c: chatmod.ChatSession) -> list[str]:
+    exe = find_claude()
+    if not exe:
+        raise HTTPException(400, "Claude Code CLI not found on this Mac")
+    s = _base_sandbox_settings()
+    s["permissions"]["allow"] = ["Bash", "WebFetch", "WebSearch", "WebFetch(domain:*)"]
+    tout = int(get_settings().get("permission_timeout_min") or 30) * 60
+    s["hooks"] = {
+        "PreToolUse": [{"matcher": "*", "hooks": [_hook([sys.executable, APP / "delegation_guard.py"], 15)]}],
+        "PermissionRequest": [{"matcher": "*", "hooks": [_hook(
+            [sys.executable, APP / "permission_hook.py", c.id, c.token, SERVER_PORT, tout, "chats"], tout + 60)]}]}
+    cmd = [exe, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+           "--include-partial-messages", "--model", c.model, "--append-system-prompt", rules.SELFDEV_PROMPT,
+           "--settings", json.dumps(s), "--setting-sources", "project", "--permission-mode", "acceptEdits",
+           "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+           "--no-session-persistence", "--tools", CHAT_TOOLS]
+    if supports((2, 1, 259)):
+        cmd += ["--permission-prompts", "none"]
+    return cmd
+
+
+def dev_env() -> dict:
+    """Job agents can write to shared/, so the self-change session gets none of it: the app's own Python,
+    and a PATH without Agent Lab's folders."""
+    env = clean_env({"LAB_PYTHON": sys.executable, "SSL_CERT_FILE": CERT_FILE, "REQUESTS_CA_BUNDLE": CERT_FILE,
+                     "PYTHONDONTWRITEBYTECODE": "1"})
+    env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    return env
+
+
+def dev_blockers() -> list[str]:
+    """Why applying (which restarts Agent Lab) has to wait."""
+    out = []
+    running = [j for j in (read_json(p / "job.json") for p in job_dirs()) if j and j.get("status") in ACTIVE]
+    if running:
+        out.append(f"{len(running)} job{'s' if len(running) > 1 else ''} running")
+    if any(c.busy for c in list(CHATS.values())):
+        out.append("an Ask chat is answering")
+    return out
+
+
+@app.get("/api/selfdev")
+def api_dev_get(since: int = 0):
+    c = DEV["session"]
+    active = None
+    if c and DEV["rid"]:
+        active = {"record": read_json(dev_dir(DEV["rid"]) / "record.json"), "chat": c.view(since)}
+    runs = []
+    last = dev_last_applied()
+    for rec in dev_records()[:30]:
+        row = {k: rec.get(k) for k in ("id", "created", "request", "push", "model", "status", "title", "summary",
+                                       "changes", "stray", "checks", "review", "waiting_for", "push_result",
+                                       "applied", "undone", "error", "cost", "push_pending")}
+        row["can_undo"] = rec["id"] == last and rec.get("status") in ("applied", "failed")
+        runs.append(row)
+    s = get_settings()
+    return {"active": active, "runs": runs, "repo": s.get("github_repo"), "auto_push": s.get("auto_push", True),
+            "git_problem": selfdev.git_problem() if s.get("github_repo") else None}
+
+
+@app.post("/api/selfdev")
+def api_dev_start(body: dict):
+    request = str(body.get("request") or "").strip()
+    if not request:
+        raise HTTPException(400, "Describe the change first")
+    with DEV_LOCK:
+        if DEV["session"] and not DEV["session"].ended:
+            raise HTTPException(409, "A change is already being made. Wait for it, or stop it.")
+        if any(r.get("status") in IN_PROGRESS for r in dev_records()):
+            raise HTTPException(409, "The last change is still being checked or applied.")
+        rid = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+        rd = dev_dir(rid)
+        selfdev.stage(LAB, rd / "base")
+        selfdev.stage(LAB, rd / "work")
+        rec = {"id": rid, "created": time.time(), "request": request, "push": bool(body.get("push", True)),
+               "model": get_settings().get("selfdev_model") or chat_model(), "status": "running"}
+        save_dev(rec)
+        c = chatmod.ChatSession("selfdev:" + rid, rec["model"])
+        try:
+            c.start(selfdev_command(c), str(rd / "work"), dev_env())
+            c.send(request)
+        except Exception as e:  # noqa: BLE001
+            rec.update(status="failed", error=str(e))
+            save_dev(rec)
+            raise HTTPException(500, f"couldn't start: {e}")
+        DEV.update(session=c, rid=rid)
+    threading.Thread(target=dev_watch, args=(rid, c), daemon=True).start()
+    return rec
+
+
+def dev_watch(rid: str, c: chatmod.ChatSession):
+    """When the session's turn ends: record it, compare, check, and apply if everything passes."""
+    while c.busy and not c.ended:
+        time.sleep(1)
+    time.sleep(0.5)
+    view = c.view()
+    c.close(wait=True)
+    rec = load_dev(rid)
+    items = view["items"]
+    texts = [it["text"] for it in items if it["role"] == "assistant"]
+    summary = (texts[-1] if texts else "").strip()
+    rec.update(transcript=items[-500:], cost=round(view["cost"], 4), summary=summary,
+               title=(summary.splitlines() or [""])[0].strip("# *`").strip()[:100] or "Update Agent Lab")
+    with DEV_LOCK:
+        if DEV["rid"] == rid:
+            DEV.update(session=None, rid=None)
+        if rec["status"] == "cancelled":
+            save_dev(rec)
+            return
+        rec["status"] = "checking"
+        save_dev(rec)  # from here on, Stop no longer applies
+    try:
+        rd = dev_dir(rid)
+        chs, stray = selfdev.changes(rd / "base", rd / "work")
+        rec.update(changes=chs, stray=stray)
+        if not chs:
+            rec["status"] = "no_change"
+            save_dev(rec)
+            return
+        (rd / "diff.patch").write_text(selfdev.unified_diff(rd / "base", rd / "work", chs))
+        rec["status"] = "checking"
+        save_dev(rec)
+        res = selfdev.run_checks(rd / "work", sys.executable, rd / "check", [x["path"] for x in chs], base=rd / "base")
+        rec["checks"] = {"ok": res["ok"], "log": res["log"]}
+        review = list(res["needs_review"])
+        if items and items[-1]["role"] == "error":
+            review.append("the assistant's session ended with an error")
+        rec["review"] = review
+        rec["status"] = "checks_failed" if not res["ok"] else "needs_review" if review else "waiting"
+    except Exception as e:  # noqa: BLE001
+        rec.update(status="failed", error=f"{type(e).__name__}: {e}")
+    with DEV_LOCK:
+        if (read_json(dev_dir(rid) / "record.json") or {}).get("status") == "cancelled":
+            return  # stopped meanwhile
+        save_dev(rec)
+    if rec["status"] == "waiting":
+        dev_try_apply(rid)
+
+
+def dev_try_apply(rid: str):
+    rec = load_dev(rid)
+    if rec.get("status") != "waiting":
+        return
+    blockers = dev_blockers()
+    if not blockers:
+        dev_apply(rid)
+        return
+    rec["waiting_for"] = blockers
+    save_dev(rec)
+    with DEV_LOCK:
+        if DEV["poller"]:
+            return
+        DEV["poller"] = True
+
+    def poll():
+        try:
+            while True:
+                time.sleep(10)
+                r = read_json(dev_dir(rid) / "record.json") or {}
+                if r.get("status") != "waiting":
+                    return
+                b = dev_blockers()
+                if not b:
+                    dev_apply(rid)
+                    return
+                if b != r.get("waiting_for"):
+                    r["waiting_for"] = b
+                    save_dev(r)
+        finally:
+            DEV["poller"] = False
+    threading.Thread(target=poll, daemon=True).start()
+
+
+def dev_apply(rid: str):
+    rec = load_dev(rid)
+    if rec.get("status") != "waiting":
+        return
+    rec.update(status="applying", waiting_for=None)
+    save_dev(rec)
+    try:
+        selfdev.apply(LAB, dev_dir(rid) / "work", dev_dir(rid), rec["changes"])
+    except Exception as e:  # noqa: BLE001
+        rec.update(status="failed", error=f"applying failed part-way: {e}. Press Undo to put back the previous files.")
+        save_dev(rec)
+        return
+    rec.update(status="restarting", applied=time.time(), push_pending=bool(rec.get("push")))
+    save_dev(rec)
+    restart_server(1.0)
+
+
+def dev_push(rid: str, undo: bool = False, overwrite: bool = False):
+    with PUSH_LOCK:
+        rec = load_dev(rid)
+        rec["push_result"] = {"status": "pushing"}
+        save_dev(rec)
+        title = rec.get("title") or "Update Agent Lab"
+        if undo:
+            msg = f"Undo: {title}\n\nPutting back the previous version (done from Agent Lab's Modify app tab)."
+        else:
+            body = "\n".join((rec.get("summary") or "").splitlines()[1:]).strip()[:1500]
+            msg = f"{title}\n\n{body}\n\nMade from Agent Lab's Modify app tab.".replace("\n\n\n", "\n\n")
+        res = selfdev.publish(LAB, get_settings(), msg, overwrite=overwrite)
+        rec = load_dev(rid)
+        rec.update(push_result=res, push_pending=False)
+        save_dev(rec)
+
+
+@app.post("/api/selfdev/stop")
+def api_dev_stop():
+    c, rid = DEV["session"], DEV["rid"]
+    if not c or not rid:
+        raise HTTPException(400, "nothing is running")
+    rec = load_dev(rid)
+    rec["status"] = "cancelled"
+    save_dev(rec)
+    c.close()
+    return {"ok": True}
+
+
+@app.post("/api/selfdev/{rid}/apply")
+def api_dev_apply(rid: str):
+    rec = load_dev(rid)
+    if rec.get("status") not in ("needs_review", "waiting"):
+        raise HTTPException(400, f"this change is {rec.get('status')}")
+    rec.update(status="waiting", reviewed=True)
+    save_dev(rec)
+    dev_try_apply(rid)
+    return load_dev(rid)
+
+
+@app.post("/api/selfdev/{rid}/discard")
+def api_dev_discard(rid: str):
+    rec = load_dev(rid)
+    if rec.get("status") not in ("needs_review", "waiting", "checks_failed", "no_change"):
+        raise HTTPException(400, f"this change is {rec.get('status')}")
+    rec["status"] = "discarded"
+    save_dev(rec)
+    return rec
+
+
+@app.post("/api/selfdev/{rid}/undo")
+def api_dev_undo(rid: str):
+    rec = load_dev(rid)
+    if rid != dev_last_applied() or rec.get("status") not in ("applied", "failed"):
+        raise HTTPException(400, "Only the most recent applied change can be undone.")
+    b = dev_blockers()
+    if b:
+        raise HTTPException(409, "Undoing restarts Agent Lab. Wait until nothing is running: " + ", ".join(b))
+    selfdev.undo(LAB, dev_dir(rid))
+    pushed = bool((rec.get("push_result") or {}).get("ok"))
+    rec.update(status="undo_restarting", undone=time.time(), push_pending=pushed and bool(rec.get("push")))
+    save_dev(rec)
+    restart_server(1.0)
+    return rec
+
+
+@app.post("/api/selfdev/{rid}/push")
+def api_dev_push(rid: str, body: dict):
+    rec = load_dev(rid)
+    if rec.get("status") not in ("applied", "undone"):
+        raise HTTPException(400, "Only applied (or undone) changes can be pushed.")
+    if (rec.get("push_result") or {}).get("status") == "pushing":
+        raise HTTPException(409, "already pushing")
+    threading.Thread(target=dev_push, args=(rid, rec["status"] == "undone", bool(body.get("overwrite"))), daemon=True).start()
+    return {"ok": True}
+
+
+@app.get("/api/selfdev/{rid}/diff")
+def api_dev_diff(rid: str):
+    p = dev_dir(rid) / "diff.patch"
+    return {"diff": p.read_text() if p.exists() else ""}
+
+
+@app.post("/api/selfdev/permissions/{pid}/decide")
+def api_dev_perm_decide(pid: str, body: dict):
+    if body.get("behavior") not in ("allow", "deny"):
+        raise HTTPException(400, "behavior must be allow or deny")
+    c = DEV["session"]
+    r = c.get_perm(pid) if c else None
+    if not r:
+        raise HTTPException(404, "no such request")
+    with c.lock:
+        if r["status"] != "pending":
+            raise HTTPException(400, f"this request is already {r['status']}")
+        r["status"] = "allowed" if body["behavior"] == "allow" else "denied"
+        r["message"] = str(body.get("message") or "")[:1000]
+        r["decided"] = time.time()
+    return {k: v for k, v in r.items() if k != "tool_input"}
+
+
+def dev_prune(keep: int = 5):
+    """Old self-changes keep their record and diff, but not their copies of the app (a few MB each).
+    Only the latest applied change keeps its backup, since only it can be undone."""
+    last = dev_last_applied()
+    for i, rec in enumerate(dev_records()):
+        if rec.get("status") in IN_PROGRESS:
+            continue
+        rd = dev_dir(rec["id"])
+        shutil.rmtree(rd / "check", ignore_errors=True)
+        if i >= keep:
+            shutil.rmtree(rd / "base", ignore_errors=True)
+            shutil.rmtree(rd / "work", ignore_errors=True)
+        if rec["id"] != last:
+            shutil.rmtree(rd / "backup", ignore_errors=True)
+
+
+def dev_boot():
+    """After a restart: finish what a self-change started (or note what a restart interrupted)."""
+    for rec in dev_records():
+        rid, st = rec["id"], rec.get("status")
+        marker = dev_dir(rid) / "RESTORED"
+        if marker.exists():
+            marker.unlink()
+            rec.update(status="undone", undone=time.time(), push_pending=False,
+                       error="Undone with restore-app.command.")
+            save_dev(rec)
+        elif st == "restarting":
+            rec["status"] = "applied"
+            save_dev(rec)
+            if rec.get("push_pending"):
+                threading.Thread(target=dev_push, args=(rid,), daemon=True).start()
+        elif st == "undo_restarting":
+            rec["status"] = "undone"
+            save_dev(rec)
+            if rec.get("push_pending"):
+                threading.Thread(target=dev_push, args=(rid, True), daemon=True).start()
+        elif st in ("running", "checking", "applying"):
+            rec.update(status="failed", error="Agent Lab was restarted while this change was in progress."
+                       + (" Some files may already be changed: press Undo." if st == "applying" else ""))
+            save_dev(rec)
+        elif st == "waiting":
+            threading.Thread(target=lambda r=rid: (time.sleep(3), dev_try_apply(r)), daemon=True).start()
+        elif (rec.get("push_result") or {}).get("status") == "pushing":
+            rec["push_result"] = {"ok": False, "error": "Agent Lab restarted during the push. Press Push again."}
+            save_dev(rec)
+    try:
+        dev_prune()
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- disk space
+# A background scan measures the agent-lab folder every STORAGE_EVERY seconds and after each job. Above
+# the limit in Settings (15 GB by default) you get a notification and a warning at the top of the page.
+# Free disk space is checked every minute: if it drops below the minimum, running jobs are paused, because
+# a full disk breaks macOS, not just Agent Lab.
+STORAGE_EVERY = 15 * 60
+STORAGE: dict = {"last": None, "scanning": False, "event": threading.Event()}
+STORAGE_STATE = LAB / "runtime" / "storage_state.json"
+
+
+def storage_scan() -> dict:
+    info = {}
+    for p in job_dirs():
+        j = read_json(p / "job.json") or {}
+        info[p.name] = {"title": j.get("title"), "status": j.get("status")}
+    STORAGE["scanning"] = True
+    try:
+        res = storage.scan(LAB, info)
+    finally:
+        STORAGE["scanning"] = False
+    STORAGE["last"] = res
+    storage_check_limit(res)
+    return res
+
+
+def storage_check_limit(res: dict):
+    s = get_settings()
+    limit = float(s.get("storage_limit_gb") or 15) * 1e9
+    st = read_json(STORAGE_STATE, {}) or {}
+    if res["total"] <= limit:
+        if st.get("warned_total"):
+            write_json(STORAGE_STATE, {})
+        return
+    again = (not st.get("warned_total") or res["total"] >= st["warned_total"] * 1.1
+             or time.time() - st.get("warned_at", 0) > 24 * 3600)
+    if again:
+        biggest = ", ".join(f"{(j['title'] or j['id'])[:40]} {storage.fmt(j['bytes'])}" for j in res["jobs"][:3])
+        shared = ", ".join(f"{k} {storage.fmt(v)}" for k, v in list(res["shared"].items())[:3])
+        notify("Agent Lab: storage over the limit",
+               f"Agent Lab is using {storage.fmt(res['total'])}, over your {s.get('storage_limit_gb')} GB limit.\n"
+               f"Biggest jobs: {biggest or '-'}\nShared caches: {shared or '-'}\n\n"
+               "Settings → Storage shows what's using space and can free some.", tags="floppy_disk", priority="high")
+        write_json(STORAGE_STATE, {"warned_total": res["total"], "warned_at": time.time()})
+
+
+def storage_check_free():
+    s = get_settings()
+    free = shutil.disk_usage(str(LAB)).free
+    if free >= float(s.get("min_free_gb") or 3) * 1e9:
+        return
+    paused = []
+    for jid, proc in list(PROCS.items()):
+        try:
+            job = load_job(jid)
+        except HTTPException:
+            continue
+        if job.get("status") == "running":
+            procs.pause(proc.pid)
+            job.update(status="paused", paused_at=time.time(),
+                       status_note="paused automatically: the disk is nearly full. Free some space, then press Resume")
+            save_job(job)
+            paused.append(job["title"])
+    if paused:
+        notify("Agent Lab: disk nearly full, jobs paused",
+               f"Only {storage.fmt(free)} free on the disk. Paused: {', '.join(paused)}.\n"
+               "Free some space (Settings → Storage), then resume them.", tags="warning", priority="urgent")
+
+
+def storage_loop():
+    last_scan = 0.0
+    while True:
+        try:
+            storage_check_free()
+            if time.time() - last_scan > STORAGE_EVERY or STORAGE["event"].is_set():
+                STORAGE["event"].clear()
+                last_scan = time.time()
+                storage_scan()
+        except Exception as e:  # noqa: BLE001
+            print(f"Agent Lab: storage check failed: {e}", flush=True)
+        STORAGE["event"].wait(60)
+
+
+@app.get("/api/storage")
+def api_storage():
+    s = get_settings()
+    return {"last": STORAGE["last"], "scanning": STORAGE["scanning"], "limit_gb": s.get("storage_limit_gb"),
+            "min_free_gb": s.get("min_free_gb")}
+
+
+@app.post("/api/storage/scan")
+def api_storage_scan():
+    STORAGE["event"].set()
+    return {"ok": True}
+
+
+@app.post("/api/storage/clean")
+def api_storage_clean(body: dict):
+    what = body.get("what")
+    if what == "venvs":
+        busy = {jid for jid, c in CHATS.items() if c.busy}
+        works = [p / "work" for p in job_dirs()
+                 if (read_json(p / "job.json") or {}).get("status") not in ACTIVE and p.name not in busy]
+        n, freed = storage.delete_venvs(works)
+        msg = f"Deleted {n} virtual environment{'s' if n != 1 else ''} of finished jobs, freeing {storage.fmt(freed)}."
+    elif what == "uv_cache":
+        if any((read_json(p / "job.json") or {}).get("status") in ACTIVE for p in job_dirs()):
+            raise HTTPException(409, "Wait until no job is running: jobs use the package cache.")
+        freed, out = storage.prune_uv_cache(LAB)
+        msg = f"Pruned the package cache, freeing {storage.fmt(freed)}."
+    elif what == "model":
+        if any((read_json(p / "job.json") or {}).get("status") in ACTIVE for p in job_dirs()):
+            raise HTTPException(409, "Wait until no job is running: a job may be using the model.")
+        try:
+            freed = storage.delete_model(LAB, str(body.get("name") or ""))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        last = STORAGE["last"]
+        if last and last.get("models"):
+            last["models"] = [m for m in last["models"] if m["name"] != body.get("name")]
+        msg = f"Deleted {str(body.get('name')).split('--', 1)[-1].replace('--', '/')}, freeing {storage.fmt(freed)}. It's downloaded again if a job needs it."
+    else:
+        raise HTTPException(400, "what must be venvs, uv_cache or model")
+    STORAGE["event"].set()
+    return {"ok": True, "message": msg}
+
+
+
 # Recover jobs that were running when the server stopped
 for p in job_dirs():
     j = read_json(p / "job.json")
@@ -1464,6 +2281,13 @@ def detach():
         os._exit(0)
     os.setsid()
     (LAB / "runtime").mkdir(exist_ok=True)
+    for name in ("server.log", "launcher.log"):  # keep logs from growing forever
+        lp = LAB / "runtime" / name
+        try:
+            if lp.stat().st_size > 5 * 2**20:
+                lp.replace(lp.with_name(name + ".1"))
+        except OSError:
+            pass
     log = os.open(str(LAB / "runtime" / "server.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     null = os.open(os.devnull, os.O_RDONLY)
     os.dup2(null, 0)
@@ -1485,4 +2309,8 @@ if __name__ == "__main__":
         sys.argv = [sys.argv[0], "--port", str(a.port)]
     if a.close_tty.startswith("/dev/tty"):
         close_terminal_window(a.close_tty)
+    dev_boot()  # after detach(): threads it starts must live in this process
+    threading.Thread(target=storage_loop, daemon=True).start()
+    for leftover in (LAB / "runtime" / "uploads").glob(".*.tmp"):  # from an upload a crash interrupted
+        leftover.unlink(missing_ok=True)
     app.serve("127.0.0.1", a.port)

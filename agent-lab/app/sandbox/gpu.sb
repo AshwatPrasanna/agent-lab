@@ -4,13 +4,19 @@
 ;; In SBPL the last matching rule wins, so each "allow" below re-opens part of a "deny" above it.
 (allow default)
 
-;; Files: no reading or writing of user data, except this job's workspace and the shared cache.
+;; Files: no reading or writing of user data, except this job's workspace, the shared cache,
+;; and any folders the user granted to this job (@GRANTS@, from jobs/<id>/access.txt).
 (deny file-read* (subpath "/Users") (subpath "/Volumes"))
-(allow file-read* (subpath "@WORK@") (subpath "@SHARED@"))
+(allow file-read* (subpath "@WORK@") (subpath "@SHARED@")@GRANTS@)
 (allow file-read-metadata @ANCESTORS@)
+;; Agent Lab's settings (tokens) and runtime files stay unreadable, even inside a granted folder.
+(deny file-read* (subpath "@LAB@/config") (subpath "@LAB@/runtime"))
 (deny file-write* (subpath "/"))
-(allow file-write* (subpath "@WORK@") (subpath "@SHARED@")
-       (subpath "/private/tmp") (subpath "/private/var/folders") (subpath "/dev"))
+(allow file-write* (subpath "/private/tmp") (subpath "/private/var/folders") (subpath "/dev")@GRANTS@)
+;; Agent Lab's own files (code, other jobs, job records, the app icon) stay read-only, even inside a
+;; granted folder. Then this job's workspace and the shared cache are opened again.
+(deny file-write* (subpath "@LAB@") (subpath "@APPBUNDLE@"))
+(allow file-write* (subpath "@WORK@") (subpath "@SHARED@"))
 
 ;; No driving other apps (they would run outside this sandbox).
 (deny appleevent-send)

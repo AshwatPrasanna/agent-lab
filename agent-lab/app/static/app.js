@@ -4,6 +4,7 @@ const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmtTime = (t) => (t ? new Date(t * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "");
 const fmtDur = (s) => (s == null ? "–" : s >= 60 ? `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, "0")}s` : `${Math.round(s)}s`);
+const fmtBytes = (n) => { if (n == null) return "–"; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1000 && i < 4) { n /= 1000; i++; } return (i < 2 ? Math.round(n) : n.toFixed(1)) + " " + u[i]; };
 const fmtK = (n) => (n == null ? "–" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
 
 async function api(path, opts = {}) {
@@ -28,6 +29,7 @@ function showTab(name) {
   if (name === "topology" && (!Topo.cfg || !Topo.dirty)) Topo.load();
   if (name === "run") { loadRunTopo(); loadPriorList(); }
   if (name === "settings") loadSettings();
+  if (name === "dev") Dev.load(); else Dev.stop();
   try { localStorage.setItem("tab", name); } catch (e) {}
   loadStatus();
 }
@@ -46,12 +48,16 @@ async function loadStatus(refresh = false) {
     pills.push(s.logged_in ? `<span class="pill ok">signed in${s.auth_method ? " · " + esc(s.auth_method) : ""}</span>` : `<span class="pill bad">not signed in: run \`claude\` once</span>`);
   }
   pills.push(`<span class="pill ${s.ntfy_configured ? "ok" : "warn"}">${s.ntfy_configured ? "ntfy on" : "ntfy not set"}</span>`);
+  const sg = s.storage;
+  if (sg && sg.free_low) pills.unshift(`<span class="pill bad storage-pill" title="Running jobs are paused when free space drops below the minimum in Settings">💾 Disk nearly full: ${esc(fmtBytes(sg.free))} free</span>`);
+  else if (sg && sg.over) pills.unshift(`<span class="pill warn storage-pill" title="Settings → Storage shows what's using space">💾 ${esc(fmtBytes(sg.total))} used (limit ${esc(sg.limit_gb)} GB)</span>`);
   if (s.code_stale) pills.unshift(`<span class="pill warn restart-pill" title="Agent Lab's files changed since it started">⟳ Update ready: restart</span>`);
   const pend = s.pending_permissions || [];
-  if (pend.length) pills.unshift(`<span class="pill bad perm-pill" data-job="${esc(pend[0].job)}" data-chat="${pend[0].chat ? 1 : ""}">✋ ${pend.length} permission request${pend.length === 1 ? "" : "s"} waiting</span>`);
+  if (pend.length) pills.unshift(`<span class="pill bad perm-pill" data-job="${esc(pend[0].job || "")}" data-chat="${pend[0].chat ? 1 : ""}" data-dev="${pend[0].selfdev ? 1 : ""}">✋ ${pend.length} permission request${pend.length === 1 ? "" : "s"} waiting</span>`);
   bar.innerHTML = pills.join("");
-  const pp = $(".perm-pill", bar); if (pp) pp.onclick = (e) => { e.stopPropagation(); showTab("jobs"); openJob(pp.dataset.job, pp.dataset.chat ? "ask" : undefined); };
+  const pp = $(".perm-pill", bar); if (pp) pp.onclick = (e) => { e.stopPropagation(); if (pp.dataset.dev) { showTab("dev"); return; } showTab("jobs"); openJob(pp.dataset.job, pp.dataset.chat ? "ask" : undefined); };
   const rp = $(".restart-pill", bar); if (rp) rp.onclick = (e) => { e.stopPropagation(); restartServer(); };
+  const sp = $(".storage-pill", bar); if (sp) sp.onclick = (e) => { e.stopPropagation(); showTab("settings"); $("#storage-card").scrollIntoView(); };
   bar.title = "Click to re-check";
   setAutoAllow(!!s.auto_allow_permissions);
 }
@@ -104,6 +110,7 @@ async function startFrom(job, mode) {
   priorPick = new Set([job.id]);
   $("#prior-all").checked = false;
   const f = $("#job-form");
+  f.elements.access.value = (job.access || []).join("\n");
   if (mode === "slurm") {
     const st = await api("/api/settings").catch(() => ({}));
     const cluster = (st.cluster_name || "").trim() || "our Slurm cluster";
@@ -124,7 +131,8 @@ Don't submit anything and don't connect to the cluster: only prepare the files.`
 $("#job-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target), msg = $("#job-form-msg");
-  if (!fd.get("file") || !fd.get("file").name) fd.delete("file");
+  const picked = fd.getAll("file").filter((x) => x && x.name);
+  fd.delete("file"); picked.forEach((x) => fd.append("file", x));
   const pr = $("#prior-all").checked ? "all" : [...priorPick].join(",");
   if (pr) fd.set("prior", pr);
   msg.className = "msg"; msg.textContent = "Starting…";
@@ -416,6 +424,8 @@ function renderJob(data, first) {
       ${pauseBtn}${active && j.status !== "cancelling" ? `<button class="danger" id="btn-cancel">Cancel</button>` : ""}</div>
     <div class="muted small"><span class="status ${j.status}">${statusLabel(j.status)}</span> · started ${fmtTime(j.started)} · topology v${j.config_version}
       ${j.time_limit_min ? ` · time limit ${j.time_limit_min} min` : ""} · <code>${esc(j.id)}</code></div>
+    ${(j.access || []).length ? `<div class="small builds-on">Can use these folders on this Mac: ${j.access.map((p) => `<code>${esc(p)}</code>`).join(", ")}</div>` : ""}
+    ${(j.spec_files || []).length ? `<div class="small builds-on">Spec files: ${j.spec_files.map((p) => `<code>${esc(p)}</code>`).join(", ")}</div>` : ""}
     ${(j.prior || []).length ? `<div class="small builds-on">Builds on: ${j.prior.map((id) => `<a href="#job=${id}" data-open="${id}">${esc(id)}</a>`).join(", ")} <span class="muted">(copies in ./prior/)</span></div>` : ""}
     ${!active && j.kind !== "selftest" ? `<div class="row next-steps"><button id="btn-use">Use in a new job</button><button id="btn-slurm">Make a Slurm version →</button></div>` : ""}
     ${j.status_note ? `<p class="msg">${esc(j.status_note)}…</p>` : ""}
@@ -489,7 +499,8 @@ function renderSub(j) {
   const body = $("#jd-body");
   if (jobSubtab === "activity") {
     const atBottom = !$(".log", body) || $(".log", body).scrollHeight - $(".log", body).scrollTop - $(".log", body).clientHeight < 40;
-    body.innerHTML = `<div class="log">${jobItems.map((it) => `<div class="it ${it.kind}"><div class="tm">${it.t}s</div>
+    const LOG_MAX = 1500, shown = jobItems.length > LOG_MAX ? jobItems.slice(-LOG_MAX) : jobItems;
+    body.innerHTML = `<div class="log">${jobItems.length > LOG_MAX ? `<p class="muted small">Showing the newest ${LOG_MAX} of ${jobItems.length} lines.</p>` : ""}${shown.map((it) => `<div class="it ${it.kind}"><div class="tm">${it.t}s</div>
       <div class="ag" style="color:${agentColor(it.agent)}">${esc(it.agent)}</div><div class="tx">${kindIcon[it.kind] ? kindIcon[it.kind] + " " : ""}${esc(it.kind === "text" && it.text.length > 1500 ? it.text.slice(0, 1500) + " …" : it.text)}</div></div>`).join("") || `<p class="muted">Waiting for the first events…</p>`}</div>`;
     const log = $(".log", body); if (atBottom) log.scrollTop = log.scrollHeight;
   } else if (jobSubtab === "result") {
@@ -654,24 +665,190 @@ const Chat = {
   },
 };
 
+/* ---------------------------------------------------------------- Modify app (Agent Lab changing itself) */
+const DEV_LABEL = { running: "working on it", checking: "checking the new code", waiting: "ready: waiting to apply",
+  applying: "applying", restarting: "restarting", undo_restarting: "undoing: restarting", applied: "applied",
+  undone: "undone", no_change: "no change made", checks_failed: "checks failed", needs_review: "needs your review",
+  cancelled: "stopped", discarded: "discarded", failed: "failed" };
+const DEV_BUSY = ["running", "checking", "waiting", "applying", "restarting", "undo_restarting"];
+const Dev = {
+  timer: null, items: [], chatId: null, key: "", permKey: "", boot: null, data: null, pushDefaultSet: false, seq: 0,
+  stop() { clearTimeout(this.timer); this.timer = null; },
+  async load() {
+    this.stop();
+    const seq = ++this.seq;  // only the latest of overlapping loads is used
+    let d;
+    try { d = await api(`/api/selfdev?since=${this.items.length ? this.items[this.items.length - 1].n + 1 : 0}`); }
+    catch (e) { if (seq === this.seq) this.timer = setTimeout(() => this.load(), 2000); return; }  // e.g. while Agent Lab restarts
+    if (seq !== this.seq) return;
+    try {  // reload the page once the restarted app (with new code) is up
+      const st = await api("/api/status");
+      if (this.boot && st.code.started !== this.boot) { location.reload(); return; }
+      this.boot = st.code.started;
+    } catch (e) {}
+    this.data = d;
+    if (!this.pushDefaultSet) { $("#dev-push").checked = d.auto_push !== false && !!d.repo; this.pushDefaultSet = true; }
+    $("#dev-repo").innerHTML = d.repo ? `(${esc(d.repo)})` : `(set your repository in <a href="#" id="dev-set">Settings</a>)`;
+    const ds = $("#dev-set"); if (ds) ds.onclick = (e) => { e.preventDefault(); showTab("settings"); };
+    const a = d.active;
+    if (a && a.chat) {
+      if (a.chat.id !== this.chatId) { this.chatId = a.chat.id; this.items = []; return this.load(); }
+      this.items.push(...a.chat.items);
+    } else { this.chatId = null; this.items = []; }
+    this.renderActive(); this.renderRuns();
+    $("#dev-go").disabled = !!a || d.runs.some((r) => DEV_BUSY.includes(r.status));
+    const busy = a || d.runs.some((r) => DEV_BUSY.includes(r.status) || r.push_pending || (r.push_result && r.push_result.status === "pushing"));
+    if ($("#tab-dev").classList.contains("active")) this.timer = setTimeout(() => this.load(), busy ? 1200 : 8000);
+  },
+  renderActive() {
+    const el = $("#dev-active"), a = this.data.active;
+    if (!a) { el.hidden = true; el.innerHTML = ""; this.key = ""; return; }
+    const c = a.chat, rec = a.record || {};
+    const key = [c.id, this.items.length, c.busy, c.draft.length, c.perms.map((p) => p.id + p.status).join()].join("|");
+    if (key === this.key || el.contains(document.activeElement)) return;
+    this.key = key; el.hidden = false;
+    const log = $(".chat-log", el), atBottom = !log || log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+    el.innerHTML = `<div class="row"><h3 class="grow" style="margin:0">Working on: ${esc(rec.request || "")}</h3><button class="danger" id="dev-stop">Stop</button></div>
+      <div class="muted small">${esc(c.model)} · ≈$${c.cost.toFixed(3)} so far</div>
+      <div class="chat-log">${this.items.map((it) => Chat.itemHtml(it)).join("")}${c.busy ? `<div class="cm assistant live">${c.draft ? md(c.draft) : `<span class="muted">working…</span>`}</div>` : ""}</div>
+      ${c.perms.filter((p) => p.status === "pending").map((p) => `<div class="perm" data-rid="${p.id}"><div><b>✋ Permission needed</b> · <span class="muted">the assistant wants to use</span> <b>${esc(p.tool_name)}</b></div>
+        <pre>${esc(p.summary)}</pre><div class="row"><input class="grow perm-note" placeholder="Optional note to the assistant">
+        <button class="danger" data-d="deny">Deny</button><button class="primary" data-d="allow">Allow once</button></div></div>`).join("")}`;
+    const nl = $(".chat-log", el); if (atBottom) nl.scrollTop = nl.scrollHeight;
+    $("#dev-stop").onclick = async () => { if (!confirm("Stop this change? Nothing will be applied.")) return; await api("/api/selfdev/stop", { method: "POST" }).catch((e) => alert(e.message)); this.load(); };
+    $$(".perm", el).forEach((card) => $$("[data-d]", card).forEach((b) => b.onclick = async () => {
+      $$("button", card).forEach((x) => (x.disabled = true));
+      try { await api(`/api/selfdev/permissions/${card.dataset.rid}/decide`, { json: { behavior: b.dataset.d, message: $(".perm-note", card).value } }); } catch (e) { alert(e.message); }
+      if (document.activeElement) document.activeElement.blur();
+      this.key = ""; this.load(); loadStatus();
+    }));
+  },
+  runsKey: "",
+  renderRuns() {
+    const el = $("#dev-runs"), runs = this.data.runs;
+    const key = JSON.stringify(runs.map((r) => [r.id, r.status, r.push_result, r.waiting_for, r.can_undo, r.push_pending])) + this.data.git_problem;
+    if (key === this.runsKey || el.contains(document.activeElement) && document.activeElement.tagName !== "BUTTON") return;
+    this.runsKey = key;
+    if (!runs.length) { el.innerHTML = `<p class="muted small">None yet.</p>`; return; }
+    el.innerHTML = runs.map((r) => {
+      const pr = r.push_result, chs = r.changes || [];
+      let push = "";
+      if (pr && pr.status === "pushing") push = `<div class="small">⇡ Pushing to GitHub…</div>`;
+      else if (pr && pr.ok) push = `<div class="small ok">✓ ${pr.nothing ? "GitHub was already up to date" : `Pushed to GitHub: <a href="${esc(pr.url)}" target="_blank">${esc(pr.commit)}</a>`}${(pr.pulled || []).length ? ` · brought in GitHub's changes to ${esc(pr.pulled.join(", "))}` : ""}</div>`;
+      else if (pr) push = `<div class="small"><span class="bad">Not pushed:</span> ${esc(pr.error)}${(pr.findings || []).length ? `<pre>${esc(pr.findings.join("\n"))}</pre>` : ""}</div>`;
+      else if (r.push_pending) push = `<div class="small muted">Will push to GitHub after the restart.</div>`;
+      const canPush = ["applied", "undone"].includes(r.status) && !(pr && pr.status === "pushing");
+      const btns = [
+        r.status === "needs_review" ? `<button class="primary" data-a="apply">Apply anyway</button>` : "",
+        ["needs_review", "waiting", "checks_failed"].includes(r.status) ? `<button data-a="discard">Discard</button>` : "",
+        r.can_undo ? `<button data-a="undo">Undo this change</button>` : "",
+        canPush && (!pr || !pr.ok) ? `<button data-a="push">Push to GitHub${pr ? " again" : ""}</button>` : "",
+        canPush && pr && pr.needs_confirm ? `<button class="danger" data-a="push-overwrite">Push anyway (replace GitHub's versions)</button>` : "",
+      ].join("");
+      return `<div class="dev-run" data-id="${r.id}">
+        <div class="row"><b class="grow">${esc(r.title || r.request)}</b><span class="status ${r.status}">${esc(DEV_LABEL[r.status] || r.status)}</span></div>
+        <div class="muted small">${fmtTime(r.created)} · you asked: “${esc((r.request || "").slice(0, 300))}”${r.cost != null ? ` · ≈$${(+r.cost).toFixed(2)}` : ""}</div>
+        ${r.waiting_for && r.status === "waiting" ? `<div class="small">Waiting until nothing is running (${esc(r.waiting_for.join(", "))}), since applying restarts Agent Lab.</div>` : ""}
+        ${r.error ? `<div class="small bad">${esc(r.error)}</div>` : ""}
+        ${(r.review || []).length && r.status === "needs_review" ? `<div class="small"><b>Not applied automatically, because:</b><ul>${r.review.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>Look at the changes, then apply or discard them.</div>` : ""}
+        ${r.summary ? `<details><summary class="small">What the assistant says</summary><div class="cm assistant">${md(r.summary)}</div></details>` : ""}
+        ${chs.length ? `<details class="dev-diff"><summary class="small">${chs.length} file${chs.length > 1 ? "s" : ""} changed: ${esc(chs.slice(0, 6).map((c) => c.path.replace(/^agent-lab\//, "")).join(", "))}${chs.length > 6 ? "…" : ""}</summary><pre class="view">Loading…</pre></details>` : ""}
+        ${r.checks ? `<details><summary class="small">Checks: ${r.checks.ok ? "passed" : "<span class='bad'>failed</span>"}</summary><pre class="view">${esc(r.checks.log)}</pre></details>` : ""}
+        ${push}
+        ${btns ? `<div class="row end">${btns}</div>` : ""}</div>`;
+    }).join("") + (this.data.git_problem ? `<p class="small bad">${esc(this.data.git_problem)}</p>` : "");
+    $$(".dev-diff", el).forEach((d) => d.addEventListener("toggle", async () => {
+      if (!d.open || d.dataset.loaded) return;
+      d.dataset.loaded = 1; const id = d.closest(".dev-run").dataset.id;
+      const r = await api(`/api/selfdev/${id}/diff`).catch((e) => ({ diff: e.message }));
+      $("pre", d).textContent = r.diff || "(no diff)";
+    }));
+    const ask = { "push-overwrite": "Push anyway? GitHub's versions of the files listed will be replaced with this computer's.",
+      apply: "Apply this change even though it wasn't approved automatically? Agent Lab will restart.",
+      undo: "Undo this change? Agent Lab will put back the previous files and restart.", discard: "Discard this change?" };
+    $$("[data-a]", el).forEach((b) => b.onclick = async () => {
+      const id = b.closest(".dev-run").dataset.id, a = b.dataset.a;
+      if (ask[a] && !confirm(ask[a])) return;
+      b.disabled = true;
+      try { await api(`/api/selfdev/${id}/${a === "push-overwrite" ? "push" : a}`, { json: a === "push-overwrite" ? { overwrite: true } : {} }); } catch (e) { alert(e.message); }
+      this.runsKey = ""; this.load();
+    });
+  },
+};
+$("#dev-go").onclick = async () => {
+  const text = $("#dev-text").value.trim(), msg = $("#dev-msg");
+  if (!text) { msg.className = "msg err"; msg.textContent = "Describe the change first."; return; }
+  $("#dev-go").disabled = true; msg.className = "msg"; msg.textContent = "Starting…";
+  try { await api("/api/selfdev", { json: { request: text, push: $("#dev-push").checked } }); $("#dev-text").value = ""; msg.textContent = ""; }
+  catch (e) { msg.className = "msg err"; msg.textContent = e.message; }
+  Dev.load();
+};
+
 /* ---------------------------------------------------------------- settings */
 const NOTIFY_KINDS = ["done", "failed", "timed_out", "cancelled"];
 async function loadSettings() {
   const s = await api("/api/settings"), f = $("#settings-form");
-  for (const k of ["ntfy_server", "ntfy_topic", "ntfy_token", "max_turns", "improver_model", "chat_model", "time_limit_min", "permission_timeout_min", "cluster_name"]) f.elements[k].value = s[k] ?? "";
+  for (const k of ["ntfy_server", "ntfy_topic", "ntfy_token", "max_turns", "improver_model", "chat_model", "selfdev_model", "github_repo", "github_token", "private_words", "storage_limit_gb", "min_free_gb", "time_limit_min", "permission_timeout_min", "cluster_name"]) f.elements[k].value = s[k] ?? "";
   for (const k of NOTIFY_KINDS) f.elements["on_" + k].checked = (s.notify_on || []).includes(k);
   f.elements.auto_analyze.checked = s.auto_analyze !== false;
+  f.elements.auto_push.checked = s.auto_push !== false;
+  loadStorage();
 }
 $("#settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target, msg = $("#settings-msg"), num = (k) => (f.elements[k].value ? +f.elements[k].value : null);
   const body = { ntfy_server: f.elements.ntfy_server.value.trim() || "https://ntfy.sh", ntfy_topic: f.elements.ntfy_topic.value.trim(),
-    ntfy_token: f.elements.ntfy_token.value, improver_model: f.elements.improver_model.value.trim(), chat_model: f.elements.chat_model.value.trim(),
+    ntfy_token: f.elements.ntfy_token.value, improver_model: f.elements.improver_model.value.trim(), chat_model: f.elements.chat_model.value.trim(), selfdev_model: f.elements.selfdev_model.value.trim(),
+    github_repo: f.elements.github_repo.value.trim(), github_token: f.elements.github_token.value.trim(),
+    private_words: f.elements.private_words.value, auto_push: f.elements.auto_push.checked,
+    storage_limit_gb: num("storage_limit_gb") || 15, min_free_gb: num("min_free_gb") || 3,
     max_turns: num("max_turns"), cluster_name: f.elements.cluster_name.value.trim(), time_limit_min: num("time_limit_min"), permission_timeout_min: num("permission_timeout_min"),
     auto_analyze: f.elements.auto_analyze.checked, notify_on: NOTIFY_KINDS.filter((k) => f.elements["on_" + k].checked) };
   try { await api("/api/settings", { json: body }); msg.className = "msg"; msg.textContent = "Saved."; loadStatus(); }
   catch (err) { msg.className = "msg err"; msg.textContent = err.message; }
 });
+let storageTimer = null;
+async function loadStorage() {
+  clearTimeout(storageTimer);
+  const d = await api("/api/storage").catch(() => null), el = $("#storage-body");
+  if (!d) return;
+  const L = d.last;
+  if (!L) { el.innerHTML = `<p class="muted small">${d.scanning ? "Measuring…" : "Not measured yet."}</p>`; }
+  else {
+    const limit = (d.limit_gb || 15) * 1e9, pct = Math.min(100, (L.total / limit) * 100);
+    const parts = Object.entries(L.parts).sort((a, b) => b[1] - a[1]).filter((x) => x[1] > 0);
+    const venvs = L.jobs.reduce((a, j) => a + j.venv, 0);
+    el.innerHTML = `<p><b>${esc(fmtBytes(L.total))}</b> used of your ${esc(d.limit_gb)} GB limit · ${esc(fmtBytes(L.free))} free on the disk
+        <span class="muted small">· measured ${fmtTime(L.scanned)}${d.scanning ? " (measuring again…)" : ""}</span></p>
+      <div class="meter"><div style="width:${pct}%" class="${L.total > limit ? "over" : ""}"></div></div>
+      <table class="checks"><tr><th>where</th><th>size</th></tr>
+        ${parts.map(([k, v]) => `<tr><td>${esc({ jobs: "jobs (workspaces, logs)", shared: "shared caches (models, datasets, packages)", runtime: "runtime (logs, app changes)", app: "the app", config: "settings and topology versions", other: "other files" }[k] || k)}</td><td>${esc(fmtBytes(v))}</td></tr>`).join("")}</table>
+      <details><summary class="small">Biggest jobs${venvs ? ` · ${esc(fmtBytes(venvs))} of it is virtual environments` : ""}</summary><table class="checks"><tr><th>job</th><th>size</th><th>of which .venv</th></tr>
+        ${L.jobs.slice(0, 12).map((j) => `<tr><td>${esc(j.title || j.id)} <span class="muted small">${esc(j.status || "")}</span></td><td>${esc(fmtBytes(j.bytes))}</td><td>${esc(fmtBytes(j.venv))}</td></tr>`).join("")}</table></details>
+      ${(L.models || []).length ? `<details><summary class="small">Downloaded models: ${esc(fmtBytes(L.models.reduce((a, m) => a + m.bytes, 0)))} (shared by all jobs; a deleted model is downloaded again when a job needs it)</summary><table class="checks">
+        ${L.models.map((m) => `<tr><td>${esc(m.name.replace(/^(models|datasets|spaces)--/, "").replace(/--/g, "/"))}${m.name.startsWith("datasets--") ? ' <span class="muted small">dataset</span>' : ""}</td><td>${esc(fmtBytes(m.bytes))}</td><td><button class="small-btn" data-model="${esc(m.name)}">Delete</button></td></tr>`).join("")}</table></details>` : ""}
+      <details><summary class="small">Shared caches</summary><table class="checks">${Object.entries(L.shared).filter((x) => x[1] > 0).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(fmtBytes(v))}</td></tr>`).join("")}</table></details>
+      ${L.prior_copies ? `<p class="muted small">Not counted: ${esc(fmtBytes(L.prior_copies))} of copies of earlier jobs (./prior/). They're clones that share space with the originals, so they use almost nothing until changed.</p>` : ""}`;
+  }
+  $$("[data-model]", el).forEach((b) => b.onclick = async () => {
+    const name = b.dataset.model.replace(/^(models|datasets|spaces)--/, "").replace(/--/g, "/");
+    if (!confirm(`Delete ${name} from the model cache? It's downloaded again the next time a job uses it.`)) return;
+    b.disabled = true; const msg = $("#storage-msg");
+    try { const r = await api("/api/storage/clean", { json: { what: "model", name: b.dataset.model } }); msg.className = "msg"; msg.textContent = r.message; b.closest("tr").remove(); }
+    catch (e) { msg.className = "msg err"; msg.textContent = e.message; b.disabled = false; }
+  });
+  if (d.scanning && $("#tab-settings").classList.contains("active")) storageTimer = setTimeout(loadStorage, 2000);
+}
+$("#btn-storage-scan").onclick = async () => { await api("/api/storage/scan", { method: "POST" }).catch(() => {}); setTimeout(loadStorage, 800); };
+for (const [id, what, ask] of [["#btn-clean-venvs", "venvs", "Delete the .venv folders of all finished jobs? Running a job's code again reinstalls its packages from the cache (usually under a minute)."],
+                               ["#btn-clean-uv", "uv_cache", "Prune the package cache? Packages no environment uses any more are removed."]]) {
+  $(id).onclick = async () => {
+    if (!confirm(ask)) return;
+    const msg = $("#storage-msg"); msg.className = "msg"; msg.textContent = "Working…";
+    try { const r = await api("/api/storage/clean", { json: { what } }); msg.textContent = r.message; setTimeout(loadStorage, 1500); }
+    catch (e) { msg.className = "msg err"; msg.textContent = e.message; }
+  };
+}
 $("#btn-test-notify").onclick = async () => {
   const msg = $("#settings-msg");
   try { await api("/api/settings/test-notify", { method: "POST" }); msg.className = "msg"; msg.textContent = "Sent. Check your phone. (Save the settings first if you just changed them.)"; }

@@ -56,6 +56,22 @@ For each check, report outcome:
 - "error" for any other failure
 For checks 8 and 9, report "allowed" if the output says GPU_OK and "blocked" if it says NO_GPU. Put a short excerpt of the output in evidence."""
 
+# Added to the self-test when the lab folder sits inside a grantable folder (e.g. the Desktop): the
+# self-test job is granted that folder, so these check that Agent Lab's own files stay protected.
+SELFTEST_GRANT_CHECKS = """14. grant_write: `echo ok > "{GRANT}/agent-lab-grant-probe.txt" && cat "{GRANT}/agent-lab-grant-probe.txt"`
+15. grant_write_app: `touch "{APP}/grant-probe"`
+16. grant_read_config: `head -c 40 "{LAB}/config/settings.json"`
+17. grant_edit_app: use the Write tool (not Bash) to create the file {APP}/edit-probe.txt containing the word probe
+18. grant_read_tool_config: use the Read tool (not Bash) on the file {LAB}/config/settings.json
+19. grant_write_other_job: `touch "{DECOY}/probe"`
+20. gpu_grant_write: `{LAB_GPU} /usr/bin/touch "{GRANT}/agent-lab-gpu-grant-probe"`
+21. gpu_grant_read_config: `{LAB_GPU} /bin/cat "{LAB}/config/settings.json"`
+"""
+SELFTEST_GRANT_EXPECT = {"grant_write": "allowed", "grant_write_app": "blocked", "grant_read_config": "blocked",
+                         "grant_edit_app": "blocked", "grant_read_tool_config": "blocked",
+                         "grant_write_other_job": "blocked", "gpu_grant_write": "allowed",
+                         "gpu_grant_read_config": "blocked"}
+
 SELFTEST_EXPECT = {"read_home": "blocked", "list_documents": "blocked", "write_home": "blocked",
                    "write_workspace": "allowed", "internet": "allowed", "read_tool_home": "blocked",
                    "write_shared": "allowed", "gpu_in_sandbox": "blocked", "gpu_launcher": "allowed",
@@ -150,3 +166,33 @@ You're the assistant in a follow-up chat on a finished Agent Lab job. A team of 
 - If you get stuck (the same error after 3 genuinely different attempts, or something the sandbox or a denied permission blocks), stop and tell the user what's blocking you.
 
 ## Sandbox facts""" + _SHARED_RULES.rstrip() + "\n"
+
+
+# The "Modify app" tab: one session that changes Agent Lab's own source (in a copy laid out like the repo).
+SELFDEV_PROMPT = """# Agent Lab: changing Agent Lab itself
+
+You're changing the source code of Agent Lab, the app the user runs their experiment jobs from. The user describes a change; you make it. Your working directory is a copy of the app's GitHub repository.
+
+## Where things are
+- `README.md`: the user-facing description. Update it when you add or change a feature.
+- `agent-lab/app/server.py`: the web server and everything about jobs: sandbox settings, running Claude Code, permissions, the Ask chat, this feature, and the API (`@app.get` / `@app.post`).
+- `agent-lab/app/webkit.py`: the tiny HTTP framework (standard library only).
+- `agent-lab/app/static/index.html`, `app.js`, `style.css`: the whole web page (plain JavaScript, no build step).
+- `agent-lab/app/rules.py`: fixed prompt texts. `presets.py`: default topologies. `topology.py`: turns the drawn topology into Claude Code agents.
+- `agent-lab/app/chat.py`: the Ask chat. `selfdev.py`: this feature (checks, apply, undo, GitHub). `events.py`: parses Claude Code's stream-json. `procs.py`: pause and stop process trees. `prior.py`: copies earlier jobs.
+- `agent-lab/app/bin/lab-gpu` and `agent-lab/app/sandbox/gpu.sb`: the GPU launcher and its sandbox profile. `delegation_guard.py`, `permission_hook.py`: Claude Code hooks.
+- `agent-lab/start.command`, `setup.command`, `restore-app.command`, and `Agent Lab.app/` (the Desktop icon).
+
+## Rules
+- Make the change the user asked for, completely, and keep everything else working. Keep the existing style: standard-library Python that runs on Python 3.9 (keep `from __future__ import annotations`), plain JavaScript and CSS, and short, plain-English UI text.
+- Don't weaken the safety model unless the user explicitly asks: Claude Code's sandbox stays on with no unsandboxed fallback, agents' reads stay fenced to their workspace, the web app listens only on 127.0.0.1 and only accepts requests that carry the X-Agent-Lab header, agents can't change Agent Lab's own files, and secrets (tokens, settings) never reach agents. Changes to the sandbox files always wait for the user's review.
+- Never put personal details in code or docs: no names, usernames, email addresses, home-folder paths, institutions, cluster names, tokens or ntfy topics. Use generic examples. Agent Lab refuses to publish changes that contain them.
+- Don't add dependencies that need installing.
+- Work only in this folder. Put scratch files in /tmp, not here.
+- Check your work before finishing: this must pass:
+  `"$LAB_PYTHON" -c "import sys; [compile(open(f, 'rb').read(), f, 'exec') for f in sys.argv[1:]]" agent-lab/app/*.py`
+  Then re-read your changes for mistakes. You can't start the app here (localhost is blocked). After you finish, Agent Lab compiles it, starts it on a spare port, calls its API and checks the sandbox settings, then applies the change and restarts.
+- If the request is unclear, make the most reasonable interpretation and say what you assumed. If it's impossible or unsafe, change nothing and explain why.
+
+## Final message
+Start with ONE line under 70 characters, in the imperative mood, summarizing the change. It becomes the commit title (for example "Add a dark mode toggle to the header"). Then write a short paragraph on what you changed and anything the user should know."""

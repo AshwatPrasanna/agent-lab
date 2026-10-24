@@ -2,29 +2,69 @@
 # lab-gpu: run ONE command with access to the Mac's GPU (Metal / MLX / PyTorch MPS).
 # Claude Code's sandbox hides the GPU, so Agent Lab lists this script in the job's
 # `excludedCommands` and instead confines the command with its own macOS sandbox
-# profile (app/sandbox/gpu.sb): it can read/write only this job's workspace and the
-# shared cache, cannot read the rest of your home folder, and cannot reach localhost.
+# profile (app/sandbox/gpu.sb): it can read/write only this job's workspace, the shared
+# cache and any folders you granted to the job, cannot read the rest of your home folder or
+# Agent Lab's settings, and cannot reach localhost.
+#
+# Usage: lab-gpu --job <job-id> <command> [args...]   (run from that job's workspace)
+# Each job's sandbox settings exempt only "lab-gpu --job <its own id> ...", so an agent can't
+# borrow another job's identity. The folders granted to a job are read from
+# runtime/access/<id>.txt, which agents can neither read nor write, and are checked again here.
 # Agents can't modify this file or the profile: app/ is outside their writable folders.
 set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 LAB="$(cd "$APP_DIR/.." && pwd -P)"
 CWD="$(pwd -P)"
-case "$CWD/" in
-  "$LAB/jobs/"*/work/*) ;;
-  *) echo "lab-gpu: run me from inside a job workspace (cwd is $CWD)" >&2; exit 2 ;;
-esac
-rest="${CWD#"$LAB/jobs/"}"
-JOB_ID="${rest%%/*}"
-if ! [[ "$JOB_ID" =~ ^[a-z0-9-]+$ ]]; then echo "lab-gpu: bad job folder" >&2; exit 2; fi
+if [ "${1:-}" != "--job" ] || [ $# -lt 3 ]; then
+  echo "usage: lab-gpu --job <job-id> <command> [args...]" >&2; exit 2
+fi
+JOB_ID="$2"; shift 2
+if ! [[ "$JOB_ID" =~ ^[a-z0-9-]+$ ]] || [ ! -d "$LAB/jobs/$JOB_ID/work" ]; then echo "lab-gpu: unknown job $JOB_ID" >&2; exit 2; fi
 WORK="$LAB/jobs/$JOB_ID/work"
 SHARED="$LAB/shared"
-if [ $# -lt 1 ]; then echo "usage: lab-gpu <command> [args...]" >&2; exit 2; fi
+case "$CWD/" in
+  "$WORK/"*) ;;
+  *) echo "lab-gpu: run me from this job's workspace (cwd is $CWD)" >&2; exit 2 ;;
+esac
 
-# Every ancestor folder of WORK and SHARED may be stat()-ed (needed for path lookups), not read.
+# Folders the user granted to this job, checked again: inside the home folder (looked up from the
+# user database, not $HOME), not the home folder itself, not a credentials or system folder.
+U="$(id -un)"; [[ "$U" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "lab-gpu: unexpected user name" >&2; exit 2; }
+USER_HOME="$(eval "cd ~$U" && pwd -P)"
+GRANTS=""
+BASES=("$WORK" "$SHARED")
+ACCESS="$LAB/runtime/access/$JOB_ID.txt"
+if [ -f "$ACCESS" ]; then
+  while IFS= read -r g || [ -n "$g" ]; do
+    [ -z "$g" ] && continue
+    case "$g" in
+      /*) ;;
+      *) echo "lab-gpu: ignoring a folder that isn't an absolute path: $g" >&2; continue ;;
+    esac
+    case "$g" in
+      *'"'* | *'\'* | *'#'* | *'&'* | *'/../'* | *'/..') echo "lab-gpu: ignoring a folder with unsupported characters: $g" >&2; continue ;;
+    esac
+    case "$g" in
+      "$USER_HOME"/*) ;;
+      *) echo "lab-gpu: ignoring a folder outside your home folder: $g" >&2; continue ;;
+    esac
+    top="${g#"$USER_HOME"/}"; top="${top%%/*}"
+    case "$top" in
+      .ssh|.aws|.gnupg|.config|.kaggle|.docker|.netrc|Library|.claude|.claude.json|.Trash)
+        echo "lab-gpu: ignoring a protected folder: $g" >&2; continue ;;
+    esac
+    GRANTS="$GRANTS (subpath \"$g\")"
+    BASES+=("$g")
+  done < "$ACCESS"
+fi
+
+# Every ancestor folder of WORK, SHARED and the granted folders may be stat()-ed (needed for path lookups), not read.
 anc=""
-for base in "$WORK" "$SHARED"; do
+for base in "${BASES[@]}"; do
   p="$base"
   while [ "$p" != "/" ] && [ -n "$p" ]; do p="$(dirname "$p")"; anc="$anc (literal \"$p\")"; done
 done
-PROFILE="$(sed -e "s#@WORK@#$WORK#g" -e "s#@SHARED@#$SHARED#g" -e "s#@ANCESTORS@#$anc#" "$APP_DIR/sandbox/gpu.sb")"
+APPBUNDLE="$(dirname "$LAB")/Agent Lab.app"
+PROFILE="$(sed -e "s#@WORK@#$WORK#g" -e "s#@SHARED@#$SHARED#g" -e "s#@LAB@#$LAB#g" -e "s#@APPBUNDLE@#$APPBUNDLE#g" \
+               -e "s#@GRANTS@#$GRANTS#g" -e "s#@ANCESTORS@#$anc#" "$APP_DIR/sandbox/gpu.sb")"
 exec /usr/bin/sandbox-exec -p "$PROFILE" "$@"
