@@ -54,7 +54,39 @@ _ns.chmod(0o755)
 LOCK = threading.RLock()
 PROCS: dict[str, subprocess.Popen] = {}
 SERVER_PORT = int(os.environ.get("AGENT_LAB_PORT", 8765))
-LAB_GPU = str(APP / "bin" / "lab-gpu")
+
+
+def gpu_launcher_path() -> str:
+    """The path agents use to call the GPU launcher (app/bin/lab-gpu).
+
+    Claude Code exempts the launcher from its sandbox by matching the command's text, and it doesn't
+    match a quoted path. So when the lab's path has spaces in it (e.g. ~/Documents/Claude Sandbox),
+    agents call the launcher through a space-free link to the lab folder in ~/Library/Caches/agent-lab/.
+    Agents can't change that link: ~/Library is never writable to them, and can't be granted.
+    (Never an unquoted path with spaces: the shell would split it and run whatever sits at the first part.)"""
+    real = APP / "bin" / "lab-gpu"
+    if " " not in str(real):
+        return str(real)
+    import hashlib
+    links = Path.home() / "Library" / "Caches" / "agent-lab"
+    link = links / ("lab-" + hashlib.sha256(str(LAB).encode()).hexdigest()[:10])
+    if any(c.isspace() for c in str(link)):
+        return str(real)  # e.g. a home folder with a space: the GPU launcher won't be exempted
+    try:
+        links.mkdir(parents=True, exist_ok=True)
+        if not (link.is_symlink() and os.readlink(link) == str(LAB)):
+            tmp = links / f".{link.name}.{os.getpid()}.tmp"
+            if tmp.is_symlink() or tmp.exists():
+                tmp.unlink()
+            os.symlink(str(LAB), tmp)
+            os.replace(tmp, link)  # atomic: never a moment with a missing or wrong link
+    except OSError as e:
+        print(f"Agent Lab: couldn't create the GPU launcher link at {link}: {e}", flush=True)
+        return str(real)
+    return str(link / "app" / "bin" / "lab-gpu")
+
+
+LAB_GPU = gpu_launcher_path()
 CERT_FILE = "/private/etc/ssl/cert.pem" if Path("/private/etc/ssl/cert.pem").exists() else "/etc/ssl/certs/ca-certificates.crt"
 ACTIVE = ("running", "queued", "paused", "cancelling")
 
@@ -328,9 +360,9 @@ def sandbox_settings(jd: Optional[Path] = None, delegation: bool = False, job_id
 
 def gpu_prefix(job_id: str) -> str:
     """How agents of this job call the GPU launcher (the only form exempted from Claude Code's sandbox).
-    The path is shell-quoted, because the folder that holds Agent Lab may have spaces in its name; the
-    sandbox exemption uses this same quoted text, so an unquoted path (which the shell would split) never matches."""
-    return f"{shlex.quote(LAB_GPU)} --job {job_id}"
+    The path has no spaces (see gpu_launcher_path); it's still shell-quoted, so that if it ever had
+    some, the shell wouldn't split it and the exemption simply wouldn't match (no GPU, but still sandboxed)."""
+    return f"{shlex.quote(gpu_launcher_path())} --job {job_id}"  # recreates the link if it was cleaned away
 
 
 def _base_sandbox_settings(gpu_job: Optional[str] = None) -> dict:
@@ -780,6 +812,8 @@ def evaluate_selftest(d, jd: Path, job: Optional[dict] = None) -> dict:
                 got = "allowed"
             elif "NO_GPU" in ev:
                 got = "blocked"
+            else:  # neither marker: the check never got as far as asking for the GPU
+                got = "error"
         rows.append({"id": cid, "expected": want, "got": got, "ok": got == want, "evidence": ev[:300]})
     return {"passed": all(r["ok"] for r in rows), "checks": rows}
 
