@@ -63,7 +63,7 @@ DEFAULT_SETTINGS = {"ntfy_server": "https://ntfy.sh", "ntfy_topic": "", "ntfy_to
                     "time_limit_min": 120, "permission_timeout_min": 30, "auto_analyze": True,
                     "auto_allow_permissions": False, "cluster_name": "", "chat_model": "",
                     "selfdev_model": "", "github_repo": "", "github_token": "", "auto_push": True, "private_words": "",
-                    "storage_limit_gb": 15, "min_free_gb": 3}
+                    "storage_limit_gb": 15, "min_free_gb": 3, "root_dir": ""}
 SECRET_SETTINGS = ("ntfy_token", "github_token")  # never sent back to the page
 SECRET_MASK = "••••••••"
 
@@ -327,8 +327,10 @@ def sandbox_settings(jd: Optional[Path] = None, delegation: bool = False, job_id
 
 
 def gpu_prefix(job_id: str) -> str:
-    """How agents of this job call the GPU launcher (the only form exempted from Claude Code's sandbox)."""
-    return f"{LAB_GPU} --job {job_id}"
+    """How agents of this job call the GPU launcher (the only form exempted from Claude Code's sandbox).
+    The path is shell-quoted, because the folder that holds Agent Lab may have spaces in its name; the
+    sandbox exemption uses this same quoted text, so an unquoted path (which the shell would split) never matches."""
+    return f"{shlex.quote(LAB_GPU)} --job {job_id}"
 
 
 def _base_sandbox_settings(gpu_job: Optional[str] = None) -> dict:
@@ -445,6 +447,32 @@ def read_access(jid: str) -> list:
         except HTTPException:
             pass  # e.g. the folder was deleted since
     return out
+
+
+# --------------------------------------------------------------------------- the root folder
+# A folder that every job (and its Ask chat) can read and change by default, unless the job opts out.
+# Unset, it's the folder that holds Agent Lab: the agent-lab folder and Agent Lab.app (no root folder if
+# that can't be granted, e.g. the home folder itself). Agent Lab's own files inside it stay protected
+# (see protected_paths).
+def check_root(raw: str) -> str:
+    """A root folder from Settings -> its checked absolute path. Raises HTTPException if it can't be used."""
+    p = parse_access(raw)
+    if len(p) != 1:
+        raise HTTPException(400, "give exactly one folder")
+    r = Path(p[0])
+    for own in (JOBS, SHARED):
+        if r == own or own in r.parents:
+            raise HTTPException(400, f"{p[0]}: that's part of Agent Lab itself")
+    return p[0]
+
+
+def root_folder(s: Optional[dict] = None) -> Optional[str]:
+    """The root folder as a checked absolute path, or None if it can't be granted (e.g. it was deleted)."""
+    raw = str((s or get_settings()).get("root_dir") or "").strip() or str(LAB.parent)
+    try:
+        return check_root(raw)
+    except HTTPException:
+        return None
 
 
 def access_note(access: Optional[list]) -> str:
@@ -681,16 +709,16 @@ SELFTEST_DECOY = JOBS / "zz-selftest-decoy"  # stands in for "another job" in th
 
 
 def selftest_grant() -> Optional[Path]:
-    """The folder that contains the lab (e.g. the Desktop), if it can be granted."""
-    try:
-        return Path(parse_access(str(LAB.parent))[0])
-    except (HTTPException, IndexError):
-        return None
+    """The root folder (by default the folder that holds the lab), if it can be granted: every job gets it
+    by default, so the self-test checks that Agent Lab's own files stay protected inside it."""
+    r = root_folder()
+    return Path(r) if r else None
 
 
 def selftest_prompt(job: dict) -> str:
-    text = rules.SELFTEST_PROMPT.format(PY=experiment_python(), METAL=rules.METAL_CHECK, LAB_GPU=gpu_prefix(job["id"]),
-                                        HOME=str(Path.home()), APP=str(APP), PORT=SERVER_PORT)
+    q = shlex.quote  # paths may contain spaces
+    text = rules.SELFTEST_PROMPT.format(PY=q(experiment_python()), METAL=rules.METAL_CHECK, LAB_GPU=gpu_prefix(job["id"]),
+                                        HOME=q(str(Path.home())), APP=q(str(APP)), PORT=SERVER_PORT)
     if job.get("access"):
         extra = rules.SELFTEST_GRANT_CHECKS.format(GRANT=job["access"][0], APP=str(APP), LAB=str(LAB),
                                                    DECOY=str(SELFTEST_DECOY), LAB_GPU=gpu_prefix(job["id"]))
@@ -999,6 +1027,8 @@ def api_get_settings():
     s = get_settings()
     for k in SECRET_SETTINGS:
         s[k] = SECRET_MASK if s.get(k) else ""
+    s["root_effective"] = root_folder(s) or ""  # display only: not settings keys, so never saved
+    s["root_default"] = str(LAB.parent)
     return s
 
 
@@ -1028,6 +1058,14 @@ def api_set_settings(body: dict):
     s["github_repo"] = str(s.get("github_repo") or "").strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
     if s["github_repo"] and not re.fullmatch(r"[\w.-]+/[\w.-]+", s["github_repo"]):
         raise HTTPException(400, "GitHub repository: use the form owner/name")
+    s["root_dir"] = str(s.get("root_dir") or "").strip()
+    if s["root_dir"]:
+        try:
+            s["root_dir"] = check_root(s["root_dir"])
+        except HTTPException as e:
+            raise HTTPException(400, f"Root folder: {e.detail}")
+        if s["root_dir"] == str(LAB.parent.resolve()):
+            s["root_dir"] = ""  # the default: keeps following Agent Lab if its folder is moved
     write_json(SETTINGS_FILE, s)
     if s["auto_allow_permissions"]:
         approve_all_pending()
@@ -1223,6 +1261,13 @@ def api_create_job(form: dict):
         raise HTTPException(400, "Give a specification (text or a file)")
     extra = {"time_limit_min": int(tl)} if tl.isdigit() and int(tl) > 0 else {}
     access = parse_access(form.get("access", ""))
+    if str(form.get("use_root", "1")).strip().lower() not in ("0", "false", "off", "no", ""):
+        root = root_folder()
+        if root:
+            access = [root] + [p for p in access if p != root]
+        elif str(get_settings().get("root_dir") or "").strip():  # unset and not grantable (e.g. the home folder): none
+            raise HTTPException(400, "The root folder set in Settings can't be used (it may have been moved or deleted). "
+                                     "Change it in Settings, or untick the root folder for this job.")
     if access:
         extra["access"] = access
     want = str(form.get("prior", "")).strip()

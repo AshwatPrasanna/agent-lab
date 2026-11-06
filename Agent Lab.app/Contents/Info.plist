@@ -4,14 +4,19 @@
 <dict>
   <key>CFBundleName</key><string>Agent Lab</string>
   <key>CFBundleDisplayName</key><string>Agent Lab</string>
-  <key>CFBundleIdentifier</key><string>local.agentlab.launcher</string>
-  <key>CFBundleVersion</key><string>1.0</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleIdentifier</key><string>local.agentlab.app</string>
+  <key>CFBundleVersion</key><string>1.1</string>
+  <key>CFBundleShortVersionString</key><string>1.1</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>AgentLab</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSUIElement</key><true/>
-  <key>NSDesktopFolderUsageDescription</key><string>Agent Lab keeps its jobs and settings in the agent-lab folder on your Desktop.</string>
+  <!-- The launcher is a bash script, so macOS can't read its architecture and would otherwise ask
+       for Rosetta on Apple Silicon. Everything it runs is native. -->
+  <key>LSArchitecturePriority</key><array><string>arm64</string><string>x86_64</string></array>
+  <key>LSRequiresNativeExecution</key><true/>
+  <key>NSDocumentsFolderUsageDescription</key><string>Agent Lab keeps its jobs and settings in the agent-lab folder next to this app.</string>
+  <key>NSDesktopFolderUsageDescription</key><string>Agent Lab keeps its jobs and settings in the agent-lab folder next to this app.</string>
 </dict>
 </plist>

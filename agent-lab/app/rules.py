@@ -6,6 +6,7 @@ RUNTIME_RULES = """# Agent Lab runtime rules (set by the app; these always apply
 
 ## Sandbox facts
 - Shell commands run inside a macOS sandbox. They can read and write only this job's workspace and $LAB_SHARED. Other folders, `ps`, `pkill`, `sysctl` and localhost are blocked. Don't probe these limits or try to work around them.
+- Paths may contain spaces: always quote them in shell commands, e.g. `ls "$LAB_SHARED/datasets"`.
 - You can't list or kill processes, so bound every long-running command: use the Bash tool's timeout, or a time limit inside the script. Never start an unbounded background process.
 - Downloads are preconfigured: TLS certificates (SSL_CERT_FILE), Hugging Face (HF_HUB_DISABLE_XET=1) and all caches in $LAB_SHARED. If a download fails, read the error and retry once. If it fails again, report the problem rather than diagnosing the network.
 - Set environment variables inside scripts, not as a `VAR=value command` prefix.
@@ -56,8 +57,8 @@ For each check, report outcome:
 - "error" for any other failure
 For checks 8 and 9, report "allowed" if the output says GPU_OK and "blocked" if it says NO_GPU. Put a short excerpt of the output in evidence."""
 
-# Added to the self-test when the lab folder sits inside a grantable folder (e.g. the Desktop): the
-# self-test job is granted that folder, so these check that Agent Lab's own files stay protected.
+# Added to the self-test when there's a root folder (by default the folder that holds Agent Lab): the
+# self-test job is granted it, as every job is, so these check that Agent Lab's own files stay protected.
 SELFTEST_GRANT_CHECKS = """14. grant_write: `echo ok > "{GRANT}/agent-lab-grant-probe.txt" && cat "{GRANT}/agent-lab-grant-probe.txt"`
 15. grant_write_app: `touch "{APP}/grant-probe"`
 16. grant_read_config: `head -c 40 "{LAB}/config/settings.json"`
@@ -181,7 +182,7 @@ You're changing the source code of Agent Lab, the app the user runs their experi
 - `agent-lab/app/rules.py`: fixed prompt texts. `presets.py`: default topologies. `topology.py`: turns the drawn topology into Claude Code agents.
 - `agent-lab/app/chat.py`: the Ask chat. `selfdev.py`: this feature (checks, apply, undo, GitHub). `events.py`: parses Claude Code's stream-json. `procs.py`: pause and stop process trees. `prior.py`: copies earlier jobs.
 - `agent-lab/app/bin/lab-gpu` and `agent-lab/app/sandbox/gpu.sb`: the GPU launcher and its sandbox profile. `delegation_guard.py`, `permission_hook.py`: Claude Code hooks.
-- `agent-lab/start.command`, `setup.command`, `restore-app.command`, and `Agent Lab.app/` (the Desktop icon).
+- `agent-lab/start.command`, `setup.command`, `restore-app.command`, and `Agent Lab.app/` (the launcher, which sits next to the agent-lab folder).
 
 ## Rules
 - Make the change the user asked for, completely, and keep everything else working. Keep the existing style: standard-library Python that runs on Python 3.9 (keep `from __future__ import annotations`), plain JavaScript and CSS, and short, plain-English UI text.

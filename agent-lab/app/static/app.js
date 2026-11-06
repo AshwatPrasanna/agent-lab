@@ -27,7 +27,7 @@ function showTab(name) {
   $$(".tab").forEach((t) => t.classList.toggle("active", t.id === "tab-" + name));
   if (name === "jobs") loadJobs();
   if (name === "topology" && (!Topo.cfg || !Topo.dirty)) Topo.load();
-  if (name === "run") { loadRunTopo(); loadPriorList(); }
+  if (name === "run") { loadRunTopo(); loadPriorList(); showRoot(); }
   if (name === "settings") loadSettings();
   if (name === "dev") Dev.load(); else Dev.stop();
   try { localStorage.setItem("tab", name); } catch (e) {}
@@ -109,8 +109,9 @@ async function loadPriorList() {
 async function startFrom(job, mode) {
   priorPick = new Set([job.id]);
   $("#prior-all").checked = false;
-  const f = $("#job-form");
-  f.elements.access.value = (job.access || []).join("\n");
+  const f = $("#job-form"), root = await rootPath();
+  f.elements.use_root.checked = !!root && (job.access || []).includes(root);
+  f.elements.access.value = (job.access || []).filter((p) => p !== root).join("\n");
   if (mode === "slurm") {
     const st = await api("/api/settings").catch(() => ({}));
     const cluster = (st.cluster_name || "").trim() || "our Slurm cluster";
@@ -135,10 +136,11 @@ $("#job-form").addEventListener("submit", async (e) => {
   fd.delete("file"); picked.forEach((x) => fd.append("file", x));
   const pr = $("#prior-all").checked ? "all" : [...priorPick].join(",");
   if (pr) fd.set("prior", pr);
+  fd.set("use_root", e.target.elements.use_root.checked ? "1" : "0");
   msg.className = "msg"; msg.textContent = "Starting…";
   try {
     const job = await api("/api/jobs", { method: "POST", body: fd });
-    e.target.reset(); msg.textContent = ""; priorPick = new Set();
+    e.target.reset(); msg.textContent = ""; priorPick = new Set(); showRoot();
     showTab("jobs"); openJob(job.id);
   } catch (err) { msg.className = "msg err"; msg.textContent = err.message; }
 });
@@ -784,27 +786,43 @@ $("#dev-go").onclick = async () => {
   Dev.load();
 };
 
+/* ---------------------------------------------------------------- root folder */
+// The folder every job may use by default (Settings → Root folder), shown next to its checkbox on the New job form.
+async function rootPath() {
+  const s = await api("/api/settings").catch(() => ({}));
+  return s.root_effective || "";
+}
+async function showRoot(s) {
+  const root = s ? s.root_effective || "" : await rootPath(), f = $("#job-form");
+  $("#root-path").textContent = root || "(none: set one in Settings)";
+  f.elements.use_root.disabled = !root;
+  if (!root) f.elements.use_root.checked = false;
+}
+showRoot();
+
 /* ---------------------------------------------------------------- settings */
 const NOTIFY_KINDS = ["done", "failed", "timed_out", "cancelled"];
 async function loadSettings() {
   const s = await api("/api/settings"), f = $("#settings-form");
-  for (const k of ["ntfy_server", "ntfy_topic", "ntfy_token", "max_turns", "improver_model", "chat_model", "selfdev_model", "github_repo", "github_token", "private_words", "storage_limit_gb", "min_free_gb", "time_limit_min", "permission_timeout_min", "cluster_name"]) f.elements[k].value = s[k] ?? "";
+  for (const k of ["root_dir", "ntfy_server", "ntfy_topic", "ntfy_token", "max_turns", "improver_model", "chat_model", "selfdev_model", "github_repo", "github_token", "private_words", "storage_limit_gb", "min_free_gb", "time_limit_min", "permission_timeout_min", "cluster_name"]) f.elements[k].value = s[k] ?? "";
   for (const k of NOTIFY_KINDS) f.elements["on_" + k].checked = (s.notify_on || []).includes(k);
   f.elements.auto_analyze.checked = s.auto_analyze !== false;
   f.elements.auto_push.checked = s.auto_push !== false;
+  $("#root-default").textContent = s.root_default ? ` (${s.root_default})` : "";
+  showRoot(s);
   loadStorage();
 }
 $("#settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target, msg = $("#settings-msg"), num = (k) => (f.elements[k].value ? +f.elements[k].value : null);
-  const body = { ntfy_server: f.elements.ntfy_server.value.trim() || "https://ntfy.sh", ntfy_topic: f.elements.ntfy_topic.value.trim(),
+  const body = { root_dir: f.elements.root_dir.value.trim(), ntfy_server: f.elements.ntfy_server.value.trim() || "https://ntfy.sh", ntfy_topic: f.elements.ntfy_topic.value.trim(),
     ntfy_token: f.elements.ntfy_token.value, improver_model: f.elements.improver_model.value.trim(), chat_model: f.elements.chat_model.value.trim(), selfdev_model: f.elements.selfdev_model.value.trim(),
     github_repo: f.elements.github_repo.value.trim(), github_token: f.elements.github_token.value.trim(),
     private_words: f.elements.private_words.value, auto_push: f.elements.auto_push.checked,
     storage_limit_gb: num("storage_limit_gb") || 15, min_free_gb: num("min_free_gb") || 3,
     max_turns: num("max_turns"), cluster_name: f.elements.cluster_name.value.trim(), time_limit_min: num("time_limit_min"), permission_timeout_min: num("permission_timeout_min"),
     auto_analyze: f.elements.auto_analyze.checked, notify_on: NOTIFY_KINDS.filter((k) => f.elements["on_" + k].checked) };
-  try { await api("/api/settings", { json: body }); msg.className = "msg"; msg.textContent = "Saved."; loadStatus(); }
+  try { const s = await api("/api/settings", { json: body }); msg.className = "msg"; msg.textContent = "Saved."; loadStatus(); showRoot(s); }
   catch (err) { msg.className = "msg err"; msg.textContent = err.message; }
 });
 let storageTimer = null;
@@ -860,10 +878,10 @@ $("#btn-selftest").onclick = async () => {
 
 $("#btn-restart").onclick = () => restartServer(true);
 $("#btn-shutdown").onclick = async () => {
-  if (!confirm("Stop Agent Lab? Open the Agent Lab icon on your Desktop to start it again.")) return;
+  if (!confirm("Stop Agent Lab? Open Agent Lab.app (next to the agent-lab folder) to start it again.")) return;
   try { await api("/api/admin/shutdown", { json: {} }); }
   catch (e) { alert(e.message); return; }
-  document.body.innerHTML = `<div class="card narrow" style="margin-top:60px"><h2>Agent Lab has stopped.</h2><p class="muted">Open the Agent Lab icon on your Desktop to start it again.</p></div>`;
+  document.body.innerHTML = `<div class="card narrow" style="margin-top:60px"><h2>Agent Lab has stopped.</h2><p class="muted">Open Agent Lab.app (next to the agent-lab folder) to start it again.</p></div>`;
 };
 
 /* ---------------------------------------------------------------- boot */
