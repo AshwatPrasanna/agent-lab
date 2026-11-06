@@ -4,7 +4,7 @@ A small localhost web app for macOS that runs [Claude Code](https://code.claude.
 
 It's meant for prototyping an experiment at toy scale on a Mac before scaling it up on a Slurm cluster.
 
-_Note: The app was built by Claude, using co-authored (human and AI) specifications. Although it's designed to be safe, at your own risk._
+_Note: The app was built by Claude, using co-authored (human and AI) specifications. Although it's designed to be safe, use at your own risk._
 
 ## Features
 
