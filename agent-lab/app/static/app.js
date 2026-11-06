@@ -580,12 +580,15 @@ const Chat = {
       <div class="chat-log" id="chat-log"></div><div id="chat-perms"></div>
       <div class="chat-box"><textarea id="chat-text" rows="3" placeholder="Ask a question or describe a small fix. Enter sends, Shift+Enter adds a line."></textarea>
         <div class="chat-btns"><button class="primary" id="chat-send">Send</button><button id="chat-stop" hidden>■ Stop</button></div></div>
-      <div class="row small muted chat-foot"><span id="chat-meta" class="grow"></span><button id="chat-new">New chat</button></div></div>`;
+      <div class="row small muted chat-foot"><span id="chat-meta" class="grow"></span>
+        <label class="chat-model" title="The model for the next message. Changing it mid-chat starts a new session that doesn't remember earlier messages.">Model <select id="chat-model"><option value="opus">Opus</option><option value="fable">Fable</option></select></label>
+        <button id="chat-new">New chat</button></div></div>`;
     const ta = $("#chat-text"), dk = "chat:" + j.id;
     ta.value = drafts[dk] || "";
     ta.oninput = () => (drafts[dk] = ta.value);
     ta.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); this.send(); } };
     $("#chat-send").onclick = () => this.send();
+    $("#chat-model").onchange = (e) => { e.target.dataset.picked = "1"; };
     $("#chat-stop").onclick = () => api(`/api/jobs/${this.jid}/chat/stop`, { method: "POST" }).catch((e) => alert(e.message));
     $("#chat-new").onclick = async () => {
       if (this.items.length && !confirm("Start a new chat? This conversation will be gone for good. (File changes stay.)")) return;
@@ -606,6 +609,9 @@ const Chat = {
       if (c.id !== this.id && since > 0) { this.id = c.id; this.items = []; return this.poll(); }  // a new session: reload
       this.id = c.id; this.items.push(...c.items); this.data = c;
     }
+    // the dropdown shows the live session's model, else the default from Settings, until the user picks one
+    const sel = $("#chat-model");
+    if (sel && !sel.dataset.picked) sel.value = (c && !c.ended ? c.model : r.default_model) || "opus";
     this.render();
     if (c && (c.busy || c.perms.some((p) => p.status === "pending"))) this.timer = setTimeout(() => this.poll(), 700);
   },
@@ -615,7 +621,7 @@ const Chat = {
     if (!text || (this.data && this.data.busy)) return;
     $("#chat-send").disabled = true;
     try {
-      await api(`/api/jobs/${this.jid}/chat`, { json: { message: text } });
+      await api(`/api/jobs/${this.jid}/chat`, { json: { message: text, model: $("#chat-model").value } });
       ta.value = ""; drafts["chat:" + this.jid] = "";
       this.stick = true;
     } catch (e) { alert(e.message); }

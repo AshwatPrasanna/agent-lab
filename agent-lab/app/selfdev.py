@@ -455,6 +455,15 @@ def private_terms(settings: dict) -> list[tuple[str, bool]]:
     for k in ("ntfy_topic", "ntfy_token", "github_token"):
         if len(str(settings.get(k) or "")) >= 4:
             terms.add((str(settings[k]), False))
+    owner = (settings.get("github_repo") or "").strip().split("/")[0]  # your GitHub username or organization
+    if len(owner) >= 3 and owner.lower() not in GENERIC:
+        terms.add((owner, False))
+    root = (settings.get("root_dir") or "").strip()
+    if len(root) >= 4 and root not in ("/Users", "/Volumes"):
+        terms.add((root, False))
+    server = re.sub(r"^https?://", "", (settings.get("ntfy_server") or "").strip()).strip("/")
+    if len(server) >= 4 and server != "ntfy.sh":
+        terms.add((server, False))  # a private ntfy server
     for w in re.split(r"[,\n]", settings.get("private_words") or ""):
         if w.strip():
             terms.add((w.strip(), False))
@@ -631,6 +640,8 @@ def publish(lab: Path, settings: dict, message: str, overwrite: bool = False) ->
             except UnicodeDecodeError:
                 texts[n] = raw.decode("latin-1")  # binary files are scanned too
         found = scan(texts, private_terms(settings))
+        found = [f"{n}: a .env file (personal settings) is never published" for n in names
+                 if re.fullmatch(r"\.env(\..+)?", n.rsplit("/", 1)[-1]) and not n.endswith(".example")] + found
         if found:
             _git(["reset", "-q", "--hard"], clone, env)
             return {"ok": False, "pulled": pulled, "findings": found,

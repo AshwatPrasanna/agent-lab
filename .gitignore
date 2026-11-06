@@ -3,6 +3,10 @@ agent-lab/config/
 agent-lab/jobs/
 agent-lab/shared/
 agent-lab/runtime/
+# personal settings (tokens, ntfy topic, GitHub repository, cluster name): never commit
+.env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 .DS_Store

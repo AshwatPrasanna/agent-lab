@@ -150,7 +150,7 @@
         </div>
         <div class="row">
           <label class="small">Model for analysis &amp; self-improvement <input name="improver_model" placeholder="same as orchestrator"></label>
-          <label class="small">Model for the job chat (Ask tab) <input name="chat_model" placeholder="same as analysis"></label>
+          <label class="small">Default model for the job chat (Ask tab) <select name="chat_model"><option value="opus">Opus</option><option value="fable">Fable</option></select></label>
           <label class="small">Model for app changes (Modify app tab) <input name="selfdev_model" placeholder="same as the chat"></label>
           <label class="check"><input type="checkbox" name="auto_analyze"> analyze every finished job automatically and draft an improvement</label>
         </div>
@@ -164,8 +164,9 @@
           <label class="grow">Token (optional) <input name="github_token" type="password" autocomplete="off" placeholder="only if git isn't signed in"></label>
         </div>
         <label class="check"><input type="checkbox" name="auto_push"> push app changes to GitHub by default</label>
-        <label>Never publish these words (comma-separated; your name, username, home folder path, tokens, ntfy topic and cluster name are always blocked)
+        <label>Never publish these words (comma-separated; your name, username, home folder path, tokens, ntfy topic, GitHub owner and cluster name are always blocked)
           <input name="private_words" placeholder="e.g. a lab name, a server name"></label>
+        <p class="muted small">Tokens, the ntfy topic, the repository, the cluster name, these words and the root folder are saved in <code>agent-lab/config/.env</code>, not in the code. That file is never published and agents can't read it.</p>
         <div class="row end">
           <button type="button" id="btn-test-notify">Send test notification</button>
           <button type="submit" class="primary">Save settings</button>

@@ -38,6 +38,9 @@ VERSIONS = CONFIG / "versions"
 JOBS = LAB / "jobs"
 SHARED = LAB / "shared"
 SETTINGS_FILE = CONFIG / "settings.json"
+# Personal settings (tokens, ntfy topic, GitHub repository, cluster name, private words, root folder) live
+# in their own file, config/.env, never in settings.json. It's gitignored and agents can't read it.
+ENV_FILE = CONFIG / ".env"
 for d in (VERSIONS, JOBS, SHARED / "datasets", SHARED / "bin", SHARED / "cache"):
     d.mkdir(parents=True, exist_ok=True)
 
@@ -93,10 +96,12 @@ ACTIVE = ("running", "queued", "paused", "cancelling")
 DEFAULT_SETTINGS = {"ntfy_server": "https://ntfy.sh", "ntfy_topic": "", "ntfy_token": "",
                     "notify_on": ["done", "failed", "timed_out"], "max_turns": None, "improver_model": "",
                     "time_limit_min": 120, "permission_timeout_min": 30, "auto_analyze": True,
-                    "auto_allow_permissions": False, "cluster_name": "", "chat_model": "",
+                    "auto_allow_permissions": False, "cluster_name": "", "chat_model": "opus",
                     "selfdev_model": "", "github_repo": "", "github_token": "", "auto_push": True, "private_words": "",
                     "storage_limit_gb": 15, "min_free_gb": 3, "root_dir": ""}
 SECRET_SETTINGS = ("ntfy_token", "github_token")  # never sent back to the page
+PERSONAL_SETTINGS = ("ntfy_server", "ntfy_topic", "ntfy_token", "github_repo", "github_token", "cluster_name",
+                     "private_words", "root_dir")  # kept in config/.env as AGENT_LAB_<NAME>=value
 SECRET_MASK = "••••••••"
 
 app = App(static_dir=Path(__file__).resolve().parent / "static", upload_dir=LAB / "runtime" / "uploads")
@@ -147,10 +152,81 @@ def write_json(p: Path, obj):
         raise
 
 
+def read_env(p: Path = None) -> dict:
+    """config/.env -> {setting: value}. Lines are AGENT_LAB_<NAME>=value; # starts a comment line."""
+    out = {}
+    try:
+        text = (p or ENV_FILE).read_text()
+    except (OSError, UnicodeDecodeError):
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = (x.strip() for x in line.split("=", 1))
+        key = key.removeprefix("export ").strip()
+        if not key.startswith("AGENT_LAB_"):
+            continue
+        name = key[len("AGENT_LAB_"):].lower()
+        if name not in PERSONAL_SETTINGS:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] == '"':
+            val = val[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        elif len(val) >= 2 and val[0] == val[-1] == "'":
+            val = val[1:-1]
+        out[name] = val
+    return out
+
+
+def write_env(values: dict):
+    """Write the personal settings to config/.env (readable only by you)."""
+    lines = ["# Agent Lab's personal settings. Never commit or share this file (it's in .gitignore).",
+             "# Edit it here or in Settings. Changes take effect without a restart."]
+    for k in PERSONAL_SETTINGS:
+        v = str(values.get(k) or "").replace("\r", "").replace("\n", ",")
+        lines.append(f'AGENT_LAB_{k.upper()}="' + v.replace("\\", "\\\\").replace('"', '\\"') + '"')
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(ENV_FILE.parent), prefix=".env.", suffix=".tmp")  # mode 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, ENV_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def get_settings() -> dict:
     s = copy.deepcopy(DEFAULT_SETTINGS)
-    s.update(read_json(SETTINGS_FILE, {}) or {})
+    saved = read_json(SETTINGS_FILE, {}) or {}
+    s.update(saved)  # personal values still here only until they're moved to config/.env
+    env = read_env()
+    for k in PERSONAL_SETTINGS:
+        if k in env:
+            s[k] = env[k] if env[k] or k != "ntfy_server" else DEFAULT_SETTINGS[k]
     return s
+
+
+def save_settings(s: dict):
+    """Personal settings go to config/.env, everything else to config/settings.json."""
+    write_env(s)
+    write_json(SETTINGS_FILE, {k: v for k, v in s.items() if k not in PERSONAL_SETTINGS})
+
+
+def move_personal_settings():
+    """Move personal values an older version kept in settings.json into config/.env."""
+    saved = read_json(SETTINGS_FILE, None)  # None if missing or unreadable: then leave it alone
+    if isinstance(saved, dict) and any(k in saved for k in PERSONAL_SETTINGS):
+        try:
+            save_settings(get_settings())
+        except OSError as e:
+            print(f"Agent Lab: couldn't move personal settings to {ENV_FILE.name}: {e}", flush=True)
+
+
+move_personal_settings()
 
 
 def find_claude() -> Optional[str]:
@@ -1089,6 +1165,7 @@ def api_set_settings(body: dict):
                 raise HTTPException(400, f"{k} must be a whole number")
     s["auto_allow_permissions"] = bool(s.get("auto_allow_permissions"))
     s["auto_push"] = bool(s.get("auto_push"))
+    s["chat_model"] = chat_model(str(s.get("chat_model") or ""))
     s["github_repo"] = str(s.get("github_repo") or "").strip().removeprefix("https://github.com/").removesuffix(".git").strip("/")
     if s["github_repo"] and not re.fullmatch(r"[\w.-]+/[\w.-]+", s["github_repo"]):
         raise HTTPException(400, "GitHub repository: use the form owner/name")
@@ -1100,7 +1177,7 @@ def api_set_settings(body: dict):
             raise HTTPException(400, f"Root folder: {e.detail}")
         if s["root_dir"] == str(LAB.parent.resolve()):
             s["root_dir"] = ""  # the default: keeps following Agent Lab if its folder is moved
-    write_json(SETTINGS_FILE, s)
+    save_settings(s)
     if s["auto_allow_permissions"]:
         approve_all_pending()
     return api_get_settings()
@@ -1331,7 +1408,7 @@ def api_selftest():
         extra["access"] = [str(grant)]
         SELFTEST_DECOY.mkdir(exist_ok=True)
         if not SETTINGS_FILE.exists():
-            write_json(SETTINGS_FILE, get_settings())
+            save_settings(get_settings())
     job = new_job("Sandbox self-test", kind="selftest", max_turns=60, time_limit_min=20, **extra)
     write_access_file(job["id"], extra.get("access"))
     (job_dir(job["id"]) / "work" / "spec.md").write_text("Sandbox self-test")
@@ -1600,8 +1677,13 @@ def make_room_for_chat(jid: str):
     old.close()
 
 
-def chat_model() -> str:
-    return get_settings().get("chat_model") or analysis_model()
+CHAT_MODELS = ("opus", "fable")  # the Ask tab's model dropdown; opus is the default
+
+
+def chat_model(pick: str = "") -> str:
+    """The model for a new Ask chat session: the dropdown's pick, else the setting, else opus."""
+    m = str(pick or get_settings().get("chat_model") or "").strip().lower()
+    return m if m in CHAT_MODELS else "opus"
 
 
 def _work_listing(work: Path, limit: int = 250) -> list[str]:
@@ -1701,7 +1783,7 @@ def _chat_job(jid: str) -> dict:
 def api_chat_get(jid: str, since: int = 0):
     load_job(jid)
     c = CHATS.get(jid)
-    return {"chat": c.view(since) if c else None}
+    return {"chat": c.view(since) if c else None, "models": list(CHAT_MODELS), "default_model": chat_model()}
 
 
 @app.post("/api/jobs/{jid}/chat")
@@ -1710,13 +1792,20 @@ def api_chat_send(jid: str, body: dict):
     if not text:
         raise HTTPException(400, "empty message")
     _chat_job(jid)
+    model = chat_model(str(body.get("model") or ""))
     with LOCK:
         c = CHATS.get(jid)
         if c and c.busy:
             raise HTTPException(409, "The assistant is still answering. Wait for it, or press Stop.")
+        if c and not c.ended and body.get("model") and c.model != model:
+            # the dropdown was changed mid-conversation: a new session with the new model takes over
+            with c.lock:
+                c._add("note", f"Switched from {c.model} to {model}. The new session won't remember the messages above.")
+            c.close()
+            c.ended = True
         if not c or c.ended:
             make_room_for_chat(jid)
-            new = chatmod.ChatSession(jid, chat_model(), carry=c.items if c else None)
+            new = chatmod.ChatSession(jid, model, carry=c.items if c else None)
             cmd = chat_command(jid, new)
             jd = job_dir(jid)
             new.start(cmd, str(jd / "work"), clean_env(lab_env(jd)))

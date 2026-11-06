@@ -25,8 +25,8 @@ _Note: The app was built by Claude, using co-authored (human and AI) specificati
   - Each job has a time limit (paused time doesn't count).
   - Agents are told to stop and report rather than loop when they're stuck.
 - **Building on earlier jobs.** A new job can get copies of earlier jobs' workspaces in `./prior/<job-id>/`. These are APFS clones, so they're instant and free on disk. **Make a Slurm version** turns a working local prototype into a cluster job: an sbatch script, the config for the full run, and instructions. It never submits anything.
-- **Ask: a follow-up chat on each finished job.** One assistant works in that job's folder, in the same sandbox, with the agents' activity log as context. Use it for questions about the run and for small fixes; it can read and edit files, run tests and use the GPU. The conversation is held only in memory, never written to disk: it's gone when you start a new chat or stop Agent Lab. File changes it makes are real.
-- **Modify app: Agent Lab changes itself.** Describe a change to the app in the **Modify app** tab. One assistant edits a copy of the source code. Agent Lab then checks the result: it must compile, start, answer its API and keep the sandbox settings. If it passes, Agent Lab applies it (keeping a backup), restarts once no job is running, and pushes it to your GitHub repository if you want. Changes to the sandbox files always wait for your review. **Undo** puts back the latest change, and if a change ever stops the app from starting, double-click `restore-app.command`. Before pushing, Agent Lab syncs with changes made on GitHub, and it refuses to publish your name, username, home folder, tokens, ntfy topic or cluster name.
+- **Ask: a follow-up chat on each finished job.** One assistant works in that job's folder, in the same sandbox, with the agents' activity log as context. Use it for questions about the run and for small fixes; it can read and edit files, run tests and use the GPU. A dropdown under the chat picks the model, Opus (the default) or Fable; **Settings** sets which one new chats start with. The conversation is held only in memory, never written to disk: it's gone when you start a new chat or stop Agent Lab. File changes it makes are real.
+- **Modify app: Agent Lab changes itself.** Describe a change to the app in the **Modify app** tab. One assistant edits a copy of the source code. Agent Lab then checks the result: it must compile, start, answer its API and keep the sandbox settings. If it passes, Agent Lab applies it (keeping a backup), restarts once no job is running, and pushes it to your GitHub repository if you want. Changes to the sandbox files always wait for your review. **Undo** puts back the latest change, and if a change ever stops the app from starting, double-click `restore-app.command`. Before pushing, Agent Lab syncs with changes made on GitHub, and it refuses to publish your name, username, home folder, tokens, ntfy topic, GitHub owner, cluster name or any `.env` file.
 - **Storage watch.** Agent Lab measures its folder every 15 minutes and after each job. Above a limit you set (15 GB by default), you get a notification and a warning at the top of the page. **Settings → Storage** shows what's using space: jobs, their virtual environments, downloaded models, and package caches. It can delete finished jobs' virtual environments, single models, or unused packages. If free disk space drops below a minimum (3 GB by default), running jobs are paused.
 - **Notifications** through [ntfy](https://ntfy.sh) when a job finishes, fails, times out, or needs permission.
 
@@ -69,6 +69,7 @@ Agent Lab.app      launcher; keep it next to the agent-lab folder
 agent-lab/
   app/             the server (standard-library Python), web UI, hooks, sandbox profile
   config/          topology versions and settings            (created at runtime; not in git)
+    .env           your personal settings: tokens, ntfy topic, GitHub repository, cluster name   (not in git)
   jobs/<id>/       one folder per job; work/ is the agent's workspace   (not in git)
   shared/          caches shared by jobs: datasets, Hugging Face, uv, Python   (not in git)
   runtime/         logs, setup markers, and Modify app changes with their backups   (not in git)
@@ -77,5 +78,6 @@ agent-lab/
 
 ## Notes
 
+- **Personal settings stay out of the code.** Tokens, the ntfy topic and server, the GitHub repository, the cluster name, the never-publish word list and the root folder are saved in `agent-lab/config/.env`, readable only by you. Settings in the web app read and write that file, and you can edit it by hand, one `AGENT_LAB_<NAME>="value"` per line (for example `AGENT_LAB_NTFY_TOPIC="my-lab-7f3k2q"`). `.env` files are listed in `.gitignore`, agents can't read them, and Modify app refuses to push one. Values that older versions kept in `config/settings.json` are moved there when Agent Lab starts.
 - The default topology uses Claude Code model aliases (`fable` for the orchestrator, `opus` for workers). Change them in the editor to match your plan.
 - The estimated $ shown per job is Claude Code's API-price estimate, not a bill.
