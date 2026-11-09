@@ -9,7 +9,7 @@ _Note: The app was built by Claude, using co-authored (human and AI) specificati
 ## Features
 
 - **Specs as text or files.** Paste a spec, or attach files of any type: a PDF, Markdown, Python pseudocode, a .zip of data. Zips are unpacked for the agents. Every job gets its own workspace folder.
-- **A root folder the agents can use.** Every job and its Ask chat can read and change one folder on your Mac by default: the root folder. Unless you choose another one in **Settings → Root folder**, it's the folder that holds Agent Lab (for example `~/Documents/Claude Sandbox`). You can untick it for a single job, and list more folders, such as one project folder, so a job can work on an existing project. Agent Lab's own files stay protected inside all of these: its code, settings, other jobs and the app icon. The self-test checks this.
+- **A root folder the agents can use.** Every job and its Ask chat can read and change one folder on your Mac by default: the root folder. Unless you choose another one in **Settings → Root folder**, it's the folder that holds Agent Lab (for example `~/Documents/Claude_Sandbox`). You can untick it for a single job, and list more folders, such as one project folder, so a job can work on an existing project. Agent Lab's own files stay protected inside all of these: its code, settings, other jobs and the app icon. The self-test checks this.
 - **A topology you draw.** A graph editor sets up the orchestrator and its subagents:
   - **Delegate** edges: who may spawn whom, nested up to 3 levels.
   - **Handoff** edges: whose output feeds whom.
@@ -38,7 +38,7 @@ _Note: The app was built by Claude, using co-authored (human and AI) specificati
 
 ## Getting started
 
-1. Put the `agent-lab` folder and `Agent Lab.app` side by side in a folder inside your home folder, for example `~/Documents/Claude Sandbox`. That folder becomes the root folder the agents may use (you can change it in Settings). Or keep `agent-lab` anywhere and use `start.command`.
+1. Put the `agent-lab` folder and `Agent Lab.app` side by side in a folder inside your home folder, for example `~/Documents/Claude_Sandbox`. That folder becomes the root folder the agents may use (you can change it in Settings). Or keep `agent-lab` anywhere and use `start.command`.
 2. Double-click **Agent Lab.app**, or `agent-lab/start.command`.
    - The first time, setup installs [uv](https://docs.astral.sh/uv/) and a Python 3.12 *inside the folder*. Your shell profile isn't touched.
    - Agent Lab starts in the background and opens at http://127.0.0.1:8765, and the Terminal window closes itself.
@@ -54,7 +54,7 @@ Every job runs `claude -p` with settings written by the app (`jobs/<id>/settings
 - **The OS sandbox** (Seatbelt) is on. `failIfUnavailable` is set, unsandboxed retries are not allowed, and bypass and auto permission modes are disabled.
 - **`blockReadsOutsideWorkingDirectories`:** file tools and shell commands can read only the job's workspace and `shared/`. Writes are limited to the same folders. Credential folders (`~/.ssh`, `~/.aws` and so on) are also denied explicitly.
 - **Nothing from your own setup is loaded:** no user settings, plugins, hooks, MCP servers or auto memory. `ANTHROPIC_API_KEY` is removed from the environment, so jobs use your Claude subscription.
-- **`lab-gpu`** is excluded from Claude Code's sandbox and applies its own profile (`app/sandbox/gpu.sb`) instead. That profile allows reading and writing only the job's workspace and `shared/`, and blocks reading the rest of `/Users`, localhost (the app's own API), Apple Events, and launching other apps. The launcher and profile live in `app/`, which agents can't write to. If the lab's path has spaces in it (like `~/Documents/Claude Sandbox`), agents call the launcher through a link without spaces in `~/Library/Caches/agent-lab/`, because Claude Code's sandbox exemption doesn't match quoted paths. Agents can't write to `~/Library`, and it can't be granted.
+- **`lab-gpu`** is excluded from Claude Code's sandbox and applies its own profile (`app/sandbox/gpu.sb`) instead. That profile allows reading and writing only the job's workspace and `shared/`, and blocks reading the rest of `/Users`, localhost (the app's own API), Apple Events, and launching other apps. The launcher and profile live in `app/`, which agents can't write to. If the lab's path has spaces in it (like `~/Documents/My Lab`), agents call the launcher through a link without spaces in `~/Library/Caches/agent-lab/`, because Claude Code's sandbox exemption doesn't match quoted paths. Agents can't write to `~/Library`, and it can't be granted.
 - **Granted folders** (the root folder and any others you list) are added as working directories, so agents can read and write them. Agent Lab's code, settings, runtime files, other jobs, the job's own records and the app icon stay off-limits through deny rules for the sandbox and the file tools. `lab-gpu` applies the same rules.
 - **Modify app** runs one session in a copy of the source under `runtime/`, in the same sandbox. It can't reach the running app's files. Agent Lab itself applies the change, after its checks.
 - **The Ask chat** uses the same sandbox and permission handling. Its settings and context are passed on the command line rather than written to disk, and it runs with `--no-session-persistence`.

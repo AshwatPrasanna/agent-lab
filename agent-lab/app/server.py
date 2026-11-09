@@ -63,7 +63,7 @@ def gpu_launcher_path() -> str:
     """The path agents use to call the GPU launcher (app/bin/lab-gpu).
 
     Claude Code exempts the launcher from its sandbox by matching the command's text, and it doesn't
-    match a quoted path. So when the lab's path has spaces in it (e.g. ~/Documents/Claude Sandbox),
+    match a quoted path. So when the lab's path has spaces in it (e.g. ~/Documents/My Lab),
     agents call the launcher through a space-free link to the lab folder in ~/Library/Caches/agent-lab/.
     Agents can't change that link: ~/Library is never writable to them, and can't be granted.
     (Never an unquoted path with spaces: the shell would split it and run whatever sits at the first part.)"""

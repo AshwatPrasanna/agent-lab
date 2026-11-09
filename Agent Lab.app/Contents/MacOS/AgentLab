@@ -4,7 +4,7 @@
 # that Terminal window closes itself once Agent Lab is up. The agent-lab folder sits next to this app.
 APP_PARENT="$(cd "$(dirname "$0")/../../.." && pwd -P)"
 LAB="$APP_PARENT/agent-lab"
-for alt in "$HOME/Documents/Claude Sandbox/agent-lab" "$HOME/Desktop/agent-lab"; do
+for alt in "$HOME/Documents/Claude_Sandbox/agent-lab" "$HOME/Desktop/agent-lab"; do
   [ -d "$LAB/app" ] && break
   LAB="$alt"
 done
